@@ -27,7 +27,7 @@ htmlcov/
 *.swp
 *.swo
 *~
-*.ideal
+*.idea
 
 # Local scratch space
 tmp/
