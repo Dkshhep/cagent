@@ -24,7 +24,16 @@ from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, 
 
 SENSITIVE_ENV_NAME_MARKERS = ("API_KEY", "TOKEN", "SECRET", "PASSWORD")
 REDACTED_VALUE = "<redacted>"
-DEFAULT_SHELL_ENV_ALLOWLIST = ("HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM", "TMPDIR", "TMP", "TEMP", "USER")
+# Windows 上 python 初始化 hash 随机化需要访问 CryptGenRandom，这依赖
+# SystemRoot；缺失会导致 `Fatal Python error: _Py_HashRandomization_Init`。
+# SystemDrive/APPDATA/LOCALAPPDATA 等也是 Windows 进程正常启动的常见依赖。
+# 这些变量本身不含敏感信息，加入白名单让 run_shell 在 Windows 上能真正跑 python。
+DEFAULT_SHELL_ENV_ALLOWLIST = (
+    "HOME", "LANG", "LC_ALL", "LC_CTYPE", "LOGNAME", "PATH", "PWD", "SHELL", "TERM",
+    "TMPDIR", "TMP", "TEMP", "USER",
+    "SystemRoot", "SYSTEMROOT", "SystemDrive", "APPDATA", "LOCALAPPDATA",
+    "USERPROFILE", "PATHEXT", "COMSPEC", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
+)
 DEFAULT_FEATURE_FLAGS = {
     "memory": True,
     "relevant_memory": True,
@@ -34,6 +43,7 @@ DEFAULT_FEATURE_FLAGS = {
 }
 CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
 DISTILLATION_MAX_NEW_TOKENS = 800
+RETRY_RAW_RESPONSE_PREVIEW_CHARS = 2000
 CHECKPOINT_NONE_STATUS = "no-checkpoint"
 CHECKPOINT_FULL_VALID_STATUS = "full-valid"
 CHECKPOINT_PARTIAL_STALE_STATUS = "partial-stale"
@@ -104,6 +114,7 @@ class CAgent:
         secret_env_names=None,
         feature_flags=None,
         mcp_manager=None,
+        shell_path_prepend=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -116,6 +127,10 @@ class CAgent:
         self.max_depth = max_depth
         self.read_only = read_only
         self.shell_env_allowlist = tuple(shell_env_allowlist or DEFAULT_SHELL_ENV_ALLOWLIST)
+        # 需要 prepend 到 run_shell PATH 前面的目录（例如装好目标仓库依赖的
+        # conda 环境根目录 + Scripts），让 agent 的裸 `python` 命中带依赖的解释器，
+        # 从而能自己跑测试、自我纠错，而不是盲改。
+        self.shell_path_prepend = tuple(shell_path_prepend or ())
         self.secret_env_names = {str(name).upper() for name in (secret_env_names or ())}
         self.feature_flags = dict(DEFAULT_FEATURE_FLAGS)
         if feature_flags:
@@ -373,7 +388,6 @@ class CAgent:
             You are cagent, a small local coding agent working inside a local repository.
 
             Rules:
-            - Use tools instead of guessing about the workspace.
             - Return exactly one <tool>...</tool> or one <final>...</final>.
             - Tool calls must look like:
               <tool>{{"name":"tool_name","args":{{...}}}}</tool>
@@ -383,12 +397,26 @@ class CAgent:
               <final>your answer</final>
             - Never invent tool results.
             - Keep answers concise and concrete.
+
+            Investigation and action policy:
+            - Use tools to inspect the workspace, but do not keep investigating after you have enough evidence to act.
+            - If the user gives a likely file, class, function, test name, stack trace, or code expression, inspect that target first.
+            - Prefer targeted search/read over broad repository search.
+            - Do not repeat the same tool call, or a semantically equivalent search, if it did not reveal new information.
+            - After locating the relevant implementation, prefer a minimal patch over further broad search.
+            - For bugfix tasks, if you have made 5 consecutive read-only tool calls without changing a file, the next action should be one of: patch_file, run_shell with a focused test/reproducer, delegate with a narrow investigation, or final explaining the blocker.
+            - If the problem statement suggests a concrete code change and you have inspected the surrounding code, attempt the minimal patch.
+            - After patching, run the narrowest relevant test command if possible.
+            - If a test command is unavailable or too expensive, state that in final.
+
+            File and test rules:
             - If the user asks you to create or update a specific file and the path is clear, use write_file or patch_file instead of repeatedly listing files.
             - Before writing tests for existing code, read the implementation first.
             - When writing tests, match the current implementation unless the user explicitly asked you to change the code.
             - New files should be complete and runnable, including obvious imports.
             - Do not repeat the same tool call with the same arguments if it did not help. Choose a different tool or return a final answer.
             - Required tool arguments must not be empty. Do not call read_file, write_file, patch_file, run_shell, or delegate with args={{}}.
+            - If the patch is based on a hypothesized behavior change, test at least one positive case and one edge/error case derived from the problem statement before final, unless the environment makes execution impossible.
 
             Tools:
             {tool_text}
@@ -547,6 +575,10 @@ class CAgent:
         env["PWD"] = str(self.root)
         if "PATH" not in env and os.environ.get("PATH"):
             env["PATH"] = os.environ["PATH"]
+        if self.shell_path_prepend:
+            prepend = os.pathsep.join(str(path) for path in self.shell_path_prepend)
+            existing = env.get("PATH", "")
+            env["PATH"] = prepend + os.pathsep + existing if existing else prepend
         return env
 
     def prompt_metadata(self, user_message, prompt):
@@ -1194,15 +1226,14 @@ class CAgent:
             self.last_completion_metadata = completion_metadata
             self.last_prompt_metadata = prompt_metadata
             kind, payload = self.parse(raw)
-            self.emit_trace(
-                task_state,
-                "model_parsed",
-                {
-                    "kind": kind,
-                    "completion_metadata": completion_metadata,
-                    "duration_ms": int((time.monotonic() - model_started_at) * 1000),
-                },
-            )
+            parsed_payload = {
+                "kind": kind,
+                "completion_metadata": completion_metadata,
+                "duration_ms": int((time.monotonic() - model_started_at) * 1000),
+            }
+            if kind == "retry":
+                parsed_payload.update(self.retry_trace_payload(raw))
+            self.emit_trace(task_state, "model_parsed", parsed_payload)
 
             if kind == "tool":
                 tool_steps += 1
@@ -1590,6 +1621,43 @@ class CAgent:
         if raw:
             return "final", raw
         return "retry", CAgent.retry_notice("model returned an empty response")
+
+    @staticmethod
+    def retry_trace_payload(raw):
+        raw = str(raw)
+        return {
+            "retry_reason": CAgent.retry_reason(raw),
+            "raw_response_chars": len(raw),
+            "raw_response_preview": clip(raw, RETRY_RAW_RESPONSE_PREVIEW_CHARS),
+        }
+
+    @staticmethod
+    def retry_reason(raw):
+        raw = str(raw)
+        if "<tool>" in raw and ("<final>" not in raw or raw.find("<tool>") < raw.find("<final>")):
+            body = CAgent.extract(raw, "tool")
+            try:
+                payload = json.loads(body)
+            except Exception:
+                return "model returned malformed tool JSON"
+            if not isinstance(payload, dict):
+                return "tool payload must be a JSON object"
+            if not str(payload.get("name", "")).strip():
+                return "tool payload is missing a tool name"
+            args = payload.get("args", {})
+            if args is not None and not isinstance(args, dict):
+                return "tool payload args must be a JSON object"
+            return ""
+        if "<tool" in raw and ("<final>" not in raw or raw.find("<tool") < raw.find("<final>")):
+            return "model returned malformed tool output"
+        if "<final>" in raw:
+            final = CAgent.extract(raw, "final").strip()
+            if not final:
+                return "model returned an empty <final> answer"
+            return ""
+        if not raw.strip():
+            return "model returned an empty response"
+        return "model returned malformed tool output"
 
     @staticmethod
     def retry_notice(problem=None):

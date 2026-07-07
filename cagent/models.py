@@ -242,6 +242,34 @@ def _extract_usage_cache_details(data):
     }
 
 
+def _openai_response_shape(data):
+    output = data.get("output")
+    output_items = output if isinstance(output, list) else []
+    return {
+        "top_level_keys": sorted(str(key) for key in data.keys()),
+        "status": data.get("status"),
+        "incomplete_details": data.get("incomplete_details"),
+        "model": data.get("model"),
+        "output_text_type": type(data.get("output_text")).__name__,
+        "output_item_types": [
+            str(item.get("type", type(item).__name__)) if isinstance(item, dict) else type(item).__name__
+            for item in output_items
+        ],
+        "output_item_keys": [
+            sorted(str(key) for key in item.keys()) if isinstance(item, dict) else []
+            for item in output_items
+        ],
+        "content_block_types": [
+            [
+                str(block.get("type", type(block).__name__)) if isinstance(block, dict) else type(block).__name__
+                for block in (item.get("content") if isinstance(item, dict) and isinstance(item.get("content"), list) else [])
+            ]
+            for item in output_items
+        ],
+        "usage_keys": sorted(str(key) for key in (data.get("usage") or {}).keys()),
+    }
+
+
 class OpenAICompatibleModelClient:
     def __init__(self, model, base_url, api_key, temperature, timeout):
         self.model = model
@@ -253,6 +281,79 @@ class OpenAICompatibleModelClient:
         # 避免对不支持的后端传一个“看起来统一、其实没意义”的伪参数。
         self.supports_prompt_cache = any(host in self.base_url for host in ("openai.com", "right.codes"))
         self.last_completion_metadata = {}
+
+    def _uses_chat_completions(self):
+        # GPT-5.5 on the current OpenAI-compatible backend returns only a
+        # Responses API reasoning item with no visible message text.
+        return str(self.model).lower().replace("_", "-") == "gpt-5.5"
+
+    def _metadata_from_response(self, data, prompt_cache_key, prompt_cache_retention, prompt_cache_key_sent=None, prompt_cache_retention_sent=None):
+        return {
+            "prompt_cache_supported": self.supports_prompt_cache,
+            "prompt_cache_key": prompt_cache_key,
+            "prompt_cache_retention": prompt_cache_retention,
+            "prompt_cache_key_sent": bool(prompt_cache_key) if prompt_cache_key_sent is None else bool(prompt_cache_key_sent),
+            "prompt_cache_retention_sent": bool(prompt_cache_retention) if prompt_cache_retention_sent is None else bool(prompt_cache_retention_sent),
+            **_extract_usage_cache_details(data),
+        }
+
+    def _complete_chat(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
+        payload = {
+            "model": self.model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_new_tokens,
+            "stream": False,
+        }
+        if self.temperature is not None:
+            payload["temperature"] = self.temperature
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+            "User-Agent": OPENAI_COMPATIBLE_USER_AGENT,
+        }
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+        request = urllib.request.Request(
+            self.base_url + "/chat/completions",
+            data=json.dumps(payload).encode("utf-8"),
+            headers=headers,
+            method="POST",
+        )
+        # 后端偶发 read timeout / 连接中断（尤其 right.codes 秒级抖动），首次
+        # 失败就放弃会把网络抖动误判成 agent_failed。对超时/网络类错误和 5xx
+        # 重试一次（共 2 次尝试），4xx 是请求本身的问题不重试。
+        attempts = 2
+        for attempt in range(attempts):
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    data = json.loads(response.read().decode("utf-8"))
+                break
+            except urllib.error.HTTPError as exc:
+                body = exc.read().decode("utf-8", errors="replace")
+                if exc.code >= 500 and attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(f"OpenAI-compatible request failed with HTTP {exc.code}: {body}") from exc
+            except (urllib.error.URLError, RemoteDisconnected) as exc:
+                if attempt < attempts - 1:
+                    time.sleep(0.5 * (attempt + 1))
+                    continue
+                raise RuntimeError(
+                    "Could not reach the OpenAI-compatible backend.\n"
+                    f"Base URL: {self.base_url}\n"
+                    f"Model: {self.model}"
+                ) from exc
+        if data.get("error"):
+            raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
+        self.last_completion_metadata = self._metadata_from_response(
+            data,
+            prompt_cache_key,
+            prompt_cache_retention,
+            prompt_cache_key_sent=False,
+            prompt_cache_retention_sent=False,
+        )
+        self.last_completion_metadata["endpoint"] = "chat/completions"
+        return _extract_openai_text(data)
 
     def complete(self, prompt, max_new_tokens, prompt_cache_key=None, prompt_cache_retention=None):
         """向 OpenAI-compatible `/responses` 接口发起一次模型调用。
@@ -272,6 +373,13 @@ class OpenAICompatibleModelClient:
         落到 provider API 的地方。
         """
         self.last_completion_metadata = {}
+        if self._uses_chat_completions():
+            return self._complete_chat(
+                prompt,
+                max_new_tokens,
+                prompt_cache_key=prompt_cache_key,
+                prompt_cache_retention=prompt_cache_retention,
+            )
         payload = {
             "model": self.model,
             "input": [
@@ -342,14 +450,11 @@ class OpenAICompatibleModelClient:
             if isinstance(response_data, dict) and response_data:
                 # 这些元数据会一路传回 runtime，进入 trace 和 report，
                 # 用来观察 prompt cache 是否真的命中。
-                self.last_completion_metadata = {
-                    "prompt_cache_supported": self.supports_prompt_cache,
-                    "prompt_cache_key": prompt_cache_key,
-                    "prompt_cache_retention": prompt_cache_retention,
-                    "prompt_cache_key_sent": bool(prompt_cache_key),
-                    "prompt_cache_retention_sent": bool(prompt_cache_retention),
-                    **_extract_usage_cache_details(response_data),
-                }
+                self.last_completion_metadata = self._metadata_from_response(
+                    response_data,
+                    prompt_cache_key,
+                    prompt_cache_retention,
+                )
             if text:
                 return text
             raise RuntimeError("OpenAI-compatible error: could not extract text from event stream response")
@@ -362,15 +467,15 @@ class OpenAICompatibleModelClient:
             ) from exc
         if data.get("error"):
             raise RuntimeError(f"OpenAI-compatible error: {data['error']}")
-        self.last_completion_metadata = {
-            "prompt_cache_supported": self.supports_prompt_cache,
-            "prompt_cache_key": prompt_cache_key,
-            "prompt_cache_retention": prompt_cache_retention,
-            "prompt_cache_key_sent": bool(prompt_cache_key),
-            "prompt_cache_retention_sent": bool(prompt_cache_retention),
-            **_extract_usage_cache_details(data),
-        }
-        return _extract_openai_text(data)
+        self.last_completion_metadata = self._metadata_from_response(
+            data,
+            prompt_cache_key,
+            prompt_cache_retention,
+        )
+        text = _extract_openai_text(data)
+        if not text:
+            self.last_completion_metadata["response_shape"] = _openai_response_shape(data)
+        return text
 
 
 def _extract_anthropic_text(data):
@@ -398,6 +503,26 @@ def _extract_deepseek_usage_cache_details(data):
         "cache_hit": cached_tokens > 0,
         "cache_hit_ratio": (cached_tokens / total_input_tokens) if total_input_tokens else 0.0,
         "service_tier": usage.get("service_tier"),
+    }
+
+
+def _response_shape(data):
+    content = data.get("content")
+    content_items = content if isinstance(content, list) else []
+    return {
+        "top_level_keys": sorted(str(key) for key in data.keys()),
+        "content_type": type(content).__name__,
+        "content_block_types": [
+            str(item.get("type", type(item).__name__)) if isinstance(item, dict) else type(item).__name__
+            for item in content_items
+        ],
+        "content_block_keys": [
+            sorted(str(key) for key in item.keys()) if isinstance(item, dict) else []
+            for item in content_items
+        ],
+        "stop_reason": data.get("stop_reason"),
+        "model": data.get("model"),
+        "usage_keys": sorted(str(key) for key in (data.get("usage") or {}).keys()),
     }
 
 
@@ -564,4 +689,7 @@ class DeepSeekCompatibleModelClient:
         text = _extract_anthropic_text(data)
         if text:
             return text
-        raise RuntimeError("DeepSeek-compatible error: could not extract text from response")
+        raise RuntimeError(
+            "DeepSeek-compatible error: could not extract text from response; "
+            f"response_shape={json.dumps(_response_shape(data), sort_keys=True)}"
+        )

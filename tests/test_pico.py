@@ -161,6 +161,37 @@ def test_agent_retries_after_malformed_tool_payload(tmp_path):
     assert any("valid <tool> call" in item for item in notices)
 
 
+def test_retry_trace_records_redacted_raw_response_preview_and_reason(tmp_path, monkeypatch):
+    secret = "sk-test-retry-preview-secret"
+    monkeypatch.setenv("PICO_OPENAI_API_KEY", secret)
+    raw = "<tool>" + json.dumps({"name": "read_file", "args": "bad", "note": secret + ("x" * 2500)}) + "</tool>"
+    agent = build_agent(
+        tmp_path,
+        [
+            raw,
+            "<final>Recovered.</final>",
+        ],
+    )
+
+    assert agent.ask("Trigger a malformed tool retry") == "Recovered."
+
+    trace_text = agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8")
+    trace_events = [json.loads(line) for line in trace_text.splitlines()]
+    retry_events = [
+        event
+        for event in trace_events
+        if event["event"] == "model_parsed" and event["kind"] == "retry"
+    ]
+
+    assert len(retry_events) == 1
+    retry_event = retry_events[0]
+    assert retry_event["retry_reason"] == "tool payload args must be a JSON object"
+    assert retry_event["raw_response_chars"] == len(raw)
+    assert len(retry_event["raw_response_preview"]) < retry_event["raw_response_chars"]
+    assert "<redacted>" in retry_event["raw_response_preview"]
+    assert secret not in trace_text
+
+
 def test_agent_accepts_xml_write_file_tool(tmp_path):
     agent = build_agent(
         tmp_path,
@@ -595,6 +626,112 @@ def test_openai_compatible_client_omits_prompt_cache_fields_by_default_and_marks
     assert client.last_completion_metadata["prompt_cache_retention_sent"] is False
 
 
+def test_openai_compatible_client_routes_gpt55_to_chat_completions():
+    captured = {}
+
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "choices": [
+                        {
+                            "message": {"role": "assistant", "content": "<final>ok</final>"},
+                            "finish_reason": "stop",
+                        }
+                    ],
+                    "usage": {
+                        "prompt_tokens": 1200,
+                        "prompt_tokens_details": {"cached_tokens": 0},
+                        "completion_tokens": 24,
+                        "total_tokens": 1224,
+                    },
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(request, timeout):
+        del timeout
+        captured["url"] = request.full_url
+        captured["body"] = json.loads(request.data.decode("utf-8"))
+        return FakeResponse()
+
+    client = OpenAICompatibleModelClient(
+        model="gpt-5.5",
+        base_url="https://right.codes/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+
+    with patch("urllib.request.urlopen", fake_urlopen):
+        result = client.complete("hello", 42, prompt_cache_key="prefix-hash-123")
+
+    assert result == "<final>ok</final>"
+    assert captured["url"].endswith("/chat/completions")
+    assert captured["body"]["messages"] == [{"role": "user", "content": "hello"}]
+    assert "prompt_cache_key" not in captured["body"]
+    assert client.last_completion_metadata["endpoint"] == "chat/completions"
+    assert client.last_completion_metadata["prompt_cache_key_sent"] is False
+    assert client.last_completion_metadata["input_tokens"] == 1200
+
+
+def test_openai_compatible_client_records_response_shape_when_responses_text_is_empty():
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "status": "completed",
+                    "model": "gpt-5.5",
+                    "output": [
+                        {
+                            "type": "reasoning",
+                            "id": "rs_1",
+                            "summary": [],
+                            "content": [],
+                            "encrypted_content": "redacted",
+                        }
+                    ],
+                    "usage": {
+                        "input_tokens": 512,
+                        "input_tokens_details": {"cached_tokens": 0},
+                        "output_tokens": 128,
+                    },
+                }
+            ).encode("utf-8")
+
+    client = OpenAICompatibleModelClient(
+        model="gpt-5.4",
+        base_url="https://right.codes/v1",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+
+    with patch("urllib.request.urlopen", return_value=FakeResponse()):
+        result = client.complete("hello", 42)
+
+    assert result == ""
+    shape = client.last_completion_metadata["response_shape"]
+    assert shape["status"] == "completed"
+    assert shape["output_item_types"] == ["reasoning"]
+    assert shape["content_block_types"] == [[]]
+
+
 def test_openai_compatible_client_extracts_text_from_event_stream():
     class FakeResponse:
         headers = {"Content-Type": "text/event-stream"}
@@ -823,6 +960,52 @@ def test_deepseek_compatible_client_records_cache_usage_metadata():
     assert client.last_completion_metadata["output_tokens"] == 70
     assert client.last_completion_metadata["cache_hit_ratio"] == 896 / 1044
     assert client.last_completion_metadata["service_tier"] == "standard"
+
+
+def test_deepseek_compatible_client_reports_response_shape_when_text_missing():
+    class FakeResponse:
+        headers = {"Content-Type": "application/json"}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "type": "message",
+                    "role": "assistant",
+                    "model": "deepseek-v4-pro",
+                    "content": [
+                        {"type": "thinking", "thinking": "hidden reasoning", "signature": "sig"},
+                    ],
+                    "stop_reason": "end_turn",
+                    "usage": {"input_tokens": 10, "output_tokens": 3},
+                }
+            ).encode("utf-8")
+
+    client = DeepSeekCompatibleModelClient(
+        model="deepseek-v4-pro",
+        base_url="https://api.deepseek.com/anthropic",
+        api_key="sk-test",
+        temperature=0.2,
+        timeout=30,
+    )
+
+    with patch("urllib.request.urlopen", return_value=FakeResponse()):
+        try:
+            client.complete("hello", 42)
+        except RuntimeError as exc:
+            message = str(exc)
+        else:
+            raise AssertionError("expected DeepSeek text extraction failure")
+
+    assert "could not extract text from response" in message
+    assert '"content_block_types": ["thinking"]' in message
+    assert '"content_block_keys": [["signature", "thinking", "type"]]' in message
+    assert "hidden reasoning" not in message
 
 
 def test_build_agent_uses_openai_provider_and_model_override(tmp_path):
