@@ -1,8 +1,10 @@
 import hashlib
 import json
 import locale as locale_module
+import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
@@ -85,13 +87,13 @@ SCRIPTED_MODEL_OUTPUTS = {
         '<tool name="patch_file" path="sample.txt"><old_text>placeholder</old_text><new_text>repeat-guarded</new_text></tool>',
         "<final>Done.</final>",
     ],
-    "context_reduction_checkpoint": [
+    "context_reduction_no_recovery": [
         "<final>Done.</final>",
     ],
-    "freshness_reanchor_resume": [
+    "stale_summary_invalidation": [
         "<final>Done.</final>",
     ],
-    "workspace_mismatch_resume": [
+    "legacy_checkpoint_ignored": [
         "<final>Done.</final>",
     ],
     "durable_promotion_accept": [
@@ -484,12 +486,16 @@ class BenchmarkEvaluator:
         expected_artifact_exists = artifact_file.exists()
         artifact_digest = _digest_file(artifact_file) if expected_artifact_exists else ""
 
+        verifier_env = os.environ.copy()
+        python_dir = str(Path(sys.executable).resolve().parent)
+        verifier_env["PATH"] = python_dir + os.pathsep + verifier_env.get("PATH", "")
         verifier = subprocess.run(
             task["verifier"],
             cwd=fixture_copy_root,
             shell=True,
             capture_output=True,
             text=True,
+            env=verifier_env,
         )
 
         within_budget = task_state.tool_steps <= int(task["step_budget"])

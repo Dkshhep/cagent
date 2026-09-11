@@ -21,7 +21,6 @@ STOP_REASON_TOOL_TIMEOUT = "tool_timeout"
 STOP_REASON_APPROVAL_DENIED = "approval_denied"
 STOP_REASON_DELEGATE_FAILED = "delegate_failed"
 STOP_REASON_PERSISTENCE_ERROR = "persistence_error"
-STOP_REASON_RESUME_LOAD_ERROR = "resume_load_error"
 
 
 @dataclass
@@ -35,8 +34,7 @@ class TaskState:
     last_tool: str = ""
     stop_reason: str = ""
     final_answer: str = ""
-    checkpoint_id: str = ""
-    resume_status: str = ""
+    recovery_status: str = "clean"
 
     @classmethod
     def create(cls, task_id, user_request, run_id=""):
@@ -56,8 +54,7 @@ class TaskState:
             last_tool=str(data.get("last_tool", "")),
             stop_reason=str(data.get("stop_reason", "")),
             final_answer=str(data.get("final_answer", "")),
-            checkpoint_id=str(data.get("checkpoint_id", "")),
-            resume_status=str(data.get("resume_status", "")),
+            recovery_status=str(data.get("recovery_status", "clean")),
         )
 
     def record_attempt(self):
@@ -105,6 +102,5 @@ class TaskState:
             "last_tool": self.last_tool,
             "stop_reason": self.stop_reason,
             "final_answer": self.final_answer,
-            "checkpoint_id": self.checkpoint_id,
-            "resume_status": self.resume_status,
+            "recovery_status": self.recovery_status,
         }

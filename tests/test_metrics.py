@@ -208,14 +208,18 @@ def test_run_recovery_ablation_v2_writes_expected_artifact(tmp_path):
 
     assert artifact_path.exists()
     assert artifact["artifact_type"] == "recovery-ablation-v2"
-    assert artifact["task_count"] == 10
-    assert set(artifact["variants"]) == {"resume_enabled", "resume_disabled"}
-    assert set(artifact["variants"]["resume_enabled"]["summary"]) >= {
-        "resume_success_rate",
-        "stale_reanchor_rate",
-        "workspace_drift_detection_rate",
-        "resume_false_accept_rate",
+    assert artifact["scenario_count"] == 1
+    assert set(artifact["summary"]) >= {
+        "recovery_detection_rate",
+        "mutation_block_rate",
+        "inspection_completion_rate",
+        "duplicate_mutation_rate",
+        "normal_checkpoint_leak_rate",
+        "false_positive_reinspection_count",
     }
+    assert artifact["summary"]["mutation_block_rate"] == 1.0
+    assert artifact["summary"]["duplicate_mutation_rate"] == 0.0
+    assert artifact["summary"]["normal_checkpoint_leak_rate"] == 0.0
 
 
 def test_write_benchmark_core_report_marks_resume_safe_metrics(tmp_path):
@@ -240,5 +244,6 @@ def test_write_benchmark_core_report_marks_resume_safe_metrics(tmp_path):
     assert report_path.exists()
     assert "可以安全写进简历的指标" in report_text
     assert "只适合放文档/面试展开的指标" in report_text
-    assert "resume_success_rate" in report_text
+    assert "recovery_detection_rate" in report_text
+    assert "duplicate_mutation_rate" in report_text
     assert "memory_hit_rate" in report_text

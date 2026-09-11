@@ -138,16 +138,14 @@ def test_run_fixed_benchmark_covers_recovery_and_durable_contract_rows(tmp_path)
         workspace_root=tmp_path / "workspaces",
     )
 
-    context_row = next(item for item in artifact["rows"] if item["id"] == "context_reduction_checkpoint")
+    context_row = next(item for item in artifact["rows"] if item["id"] == "context_reduction_no_recovery")
     durable_row = next(item for item in artifact["rows"] if item["id"] == "durable_promotion_reject")
 
     trace_path = (tmp_path / "workspaces" / context_row["run_dir_relpath"] / "trace.jsonl").resolve()
     trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
 
-    assert any(
-        event.get("event") == "checkpoint_created" and event.get("trigger") == "context_reduction"
-        for event in trace_events
-    )
+    assert context_row["report"]["recovery"]["status"] == "clean"
+    assert not any(event.get("event", "").startswith("recovery_checkpoint_") for event in trace_events)
     assert durable_row["report"]["durable_rejections"] == [
         "dependency-facts:secret_shaped",
         "key-decisions:transient_task_state",

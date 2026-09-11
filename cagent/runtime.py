@@ -17,7 +17,17 @@ from pathlib import Path
 
 from . import memory as memorylib
 from .context_manager import ContextManager
+from .recovery import (
+    READ_ONLY_INSPECTION_TOOLS,
+    RECOVERY_CLEAN,
+    RECOVERY_INSPECTION_REQUIRED,
+    RECOVERY_SCHEMA_VERSION,
+    SIDE_EFFECT_TOOLS,
+    RecoveryCheckpointStore,
+    capture_file_state,
+)
 from .run_store import RunStore
+from .storage import write_json_atomic
 from .task_state import TaskState
 from . import tools as toolkit
 from .workspace import IGNORED_PATH_NAMES, MAX_HISTORY, WorkspaceContext, clip, now
@@ -41,14 +51,8 @@ DEFAULT_FEATURE_FLAGS = {
     "prompt_cache": True,
     "context_distillation": True,
 }
-CHECKPOINT_SCHEMA_VERSION = "phase1-v1"
 DISTILLATION_MAX_NEW_TOKENS = 800
 RETRY_RAW_RESPONSE_PREVIEW_CHARS = 2000
-CHECKPOINT_NONE_STATUS = "no-checkpoint"
-CHECKPOINT_FULL_VALID_STATUS = "full-valid"
-CHECKPOINT_PARTIAL_STALE_STATUS = "partial-stale"
-CHECKPOINT_WORKSPACE_MISMATCH_STATUS = "workspace-mismatch"
-CHECKPOINT_SCHEMA_MISMATCH_STATUS = "schema-mismatch"
 DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
 DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
 DURABLE_MEMORY_LINE_PATTERNS = (
@@ -85,14 +89,17 @@ class SessionStore:
 
     def save(self, session):
         path = self.path(session["id"])
-        path.write_text(json.dumps(session, indent=2, ensure_ascii=False), encoding="utf-8")
+        write_json_atomic(path, session)
         return path
 
     def load(self, session_id):
         return json.loads(self.path(session_id).read_text(encoding="utf-8"))
 
     def latest(self):
-        files = sorted(self.root.glob("*.json"), key=lambda path: path.stat().st_mtime)
+        files = sorted(
+            (path for path in self.root.glob("*.json") if not path.name.endswith(".recovery.json")),
+            key=lambda path: path.stat().st_mtime,
+        )
         return files[-1].stem if files else None
 
 
@@ -154,7 +161,9 @@ class CAgent:
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
         self.context_manager = ContextManager(self)
-        self.resume_state = self.evaluate_resume_state()
+        self.recovery_store = RecoveryCheckpointStore(self.session_store.root)
+        self.recovery_checkpoint = self.recovery_store.load(self.session["id"])
+        self.recovery_state = self.evaluate_recovery_state()
         self.session_path = self.session_store.save(self.session)
         self.current_task_state = None
         self.current_run_dir = None
@@ -164,6 +173,8 @@ class CAgent:
         self.last_durable_rejections = []
         self.last_durable_superseded = []
         self._last_tool_result_metadata = {}
+        self._last_recovery_prepared = False
+        self._run_recovery_summary = dict(self.recovery_state)
         self._last_prefix_refresh = {
             "workspace_changed": False,
             "prefix_changed": False,
@@ -183,18 +194,6 @@ class CAgent:
     def _ensure_session_shape(self):
         self.session.setdefault("history", [])
         self.session.setdefault("memory", memorylib.default_memory_state())
-        checkpoints = self.session.setdefault("checkpoints", {})
-        if not isinstance(checkpoints, dict):
-            checkpoints = {}
-            self.session["checkpoints"] = checkpoints
-        checkpoints.setdefault("current_id", "")
-        checkpoints.setdefault("items", {})
-        runtime_identity = self.session.setdefault("runtime_identity", {})
-        if not isinstance(runtime_identity, dict):
-            self.session["runtime_identity"] = {}
-        resume_state = self.session.setdefault("resume_state", {})
-        if not isinstance(resume_state, dict):
-            self.session["resume_state"] = {}
 
     def current_runtime_identity(self):
         return {
@@ -212,126 +211,73 @@ class CAgent:
             "tool_signature": self.tool_signature(),
         }
 
-    def checkpoint_state(self):
-        self._ensure_session_shape()
-        return self.session["checkpoints"]
-
-    def current_checkpoint(self):
-        state = self.checkpoint_state()
-        checkpoint_id = str(state.get("current_id", "")).strip()
-        if not checkpoint_id:
-            return None
-        return state.get("items", {}).get(checkpoint_id)
-
     def invalidate_stale_memory(self):
         invalidated = self.memory.invalidate_stale_file_summaries()
         self.session["memory"] = self.memory.to_dict()
         return invalidated
 
-    """
-    上次 session 结束时 world 状态，和现在重新启动时的 world 状态，是不是同一个 world？
-    如果不是，agent 不能直接"假装什么都没发生就继续工作"——它需要知道自己所处的环境已经变了。这个函数负责诊断"变化了什么"，并给每种情况打一个状态标签。
-    CHECKPOINT_NONE_STATUS         = "no-checkpoint"        # 没有可恢复的断点
-    CHECKPOINT_FULL_VALID_STATUS   = "full-valid"           # world 没变，可以安全继续
-    CHECKPOINT_PARTIAL_STALE_STATUS = "partial-stale"       # 有些文件被人改过了
-    CHECKPOINT_WORKSPACE_MISMATCH_STATUS = "workspace-mismatch"  # 运行环境变了
-    CHECKPOINT_SCHEMA_MISMATCH_STATUS = "schema-mismatch"   # checkpoint 格式不兼容
-    
-    resume_state = {
-    "status": "partial-stale",            # 状态标签
-    "stale_paths": ["sample.txt"],        # 哪些文件过期了
-    "runtime_identity_mismatch_fields": [], # 环境哪里变了
-    "stale_summary_invalidations": 3,     # 被失效的摘要数量
-    }
-
-    """
-    def evaluate_resume_state(self):
-        previous_resume_state = dict(self.session.get("resume_state", {}) or {})
-        invalidated = self.invalidate_stale_memory()
-        checkpoint = self.current_checkpoint()
-        status = CHECKPOINT_NONE_STATUS
-        stale_paths = list(invalidated)
-        mismatch_fields = []
-        if checkpoint:
-            if checkpoint.get("schema_version") != CHECKPOINT_SCHEMA_VERSION:
-                status = CHECKPOINT_SCHEMA_MISMATCH_STATUS
-            else:
-                for item in checkpoint.get("key_files", []):
-                    path = str(item.get("path", "")).strip()
-                    if not path:
-                        continue
-                    expected = item.get("freshness")
-                    current = memorylib.file_freshness(path, self.root)
-                    if expected != current and path not in stale_paths:
-                        stale_paths.append(path)
-                saved_identity = dict(checkpoint.get("runtime_identity", {}) or self.session.get("runtime_identity", {}) or {})
-                current_identity = self.current_runtime_identity()
-                identity_keys = (
-                    "cwd",
-                    "model",
-                    "model_client",
-                    "approval_policy",
-                    "read_only",
-                    "max_steps",
-                    "max_new_tokens",
-                    "feature_flags",
-                    "shell_env_allowlist",
-                    "workspace_fingerprint",
-                    "tool_signature",
-                )
-                for key in identity_keys:
-                    if key not in saved_identity:
-                        continue
-                    if saved_identity.get(key) != current_identity.get(key):
-                        mismatch_fields.append(key)
-                mismatch_fields.sort()
-                if stale_paths:
-                    status = CHECKPOINT_PARTIAL_STALE_STATUS
-                elif mismatch_fields:
-                    status = CHECKPOINT_WORKSPACE_MISMATCH_STATUS
-                else:
-                    status = CHECKPOINT_FULL_VALID_STATUS
-
-        resume_state = {
-            "status": status,
-            "stale_paths": stale_paths,
-            "runtime_identity_mismatch_fields": mismatch_fields,
-            "stale_summary_invalidations": max(
-                len(invalidated),
-                int(previous_resume_state.get("stale_summary_invalidations", 0))
-                if status == CHECKPOINT_PARTIAL_STALE_STATUS
-                else 0,
-            ),
+    def evaluate_recovery_state(self):
+        """只判断是否存在尚未确认的副作用，并为文件目标做保守比较。"""
+        self.invalidate_stale_memory()
+        checkpoint = self.recovery_checkpoint
+        if not checkpoint:
+            return {"status": RECOVERY_CLEAN, "interrupted_tool": "", "target_changed": None}
+        tool = str(checkpoint.get("tool", ""))
+        state = {
+            "status": RECOVERY_INSPECTION_REQUIRED,
+            "interrupted_tool": tool,
+            "target_changed": None,
         }
-        self.session["resume_state"] = resume_state
-        self.session["runtime_identity"] = self.current_runtime_identity()
-        return resume_state
+        target = checkpoint.get("target")
+        if tool in {"write_file", "patch_file"} and isinstance(target, dict):
+            path = str(target.get("path", ""))
+            try:
+                _, current = capture_file_state(path, self.root)
+                state["target_changed"] = current != target.get("before")
+            except Exception:
+                # 无法比较也必须保持锁定，不能把未知状态当作 clean。
+                state["target_changed"] = None
+        return state
 
-    def render_checkpoint_text(self):
-        checkpoint = self.current_checkpoint()
+    def render_recovery_notice(self):
+        checkpoint = self.recovery_checkpoint
         if not checkpoint:
             return ""
-        lines = [
-            "Task checkpoint:",
-            f"- Resume status: {self.resume_state.get('status', CHECKPOINT_NONE_STATUS)}",
-            f"- Current goal: {checkpoint.get('current_goal', '-') or '-'}",
-            f"- Current blocker: {checkpoint.get('current_blocker', '-') or '-'}",
-            f"- Next step: {checkpoint.get('next_step', '-') or '-'}",
-        ]
-        key_files = [str(item.get("path", "")).strip() for item in checkpoint.get("key_files", []) if str(item.get("path", "")).strip()]
-        lines.append(f"- Key files: {', '.join(key_files) or '-'}")
-        if checkpoint.get("completed"):
-            lines.append("- Completed: " + " | ".join(str(item) for item in checkpoint.get("completed", [])))
-        if checkpoint.get("failed"):
-            lines.append("- Failed: " + " | ".join(str(item) for item in checkpoint.get("failed", [])))
-        if checkpoint.get("excluded"):
-            lines.append("- Excluded: " + " | ".join(str(item) for item in checkpoint.get("excluded", [])))
-        if self.resume_state.get("stale_paths"):
-            lines.append("- Stale paths: " + ", ".join(self.resume_state["stale_paths"]))
-        summary = str(checkpoint.get("summary", "")).strip()
-        if summary:
-            lines.append(f"- Summary: {summary}")
-        return "\n".join(lines)
+        tool = str(checkpoint.get("tool", "unknown"))
+        if tool not in {"write_file", "patch_file"}:
+            command = str((checkpoint.get("args_summary") or {}).get("command", "")).strip()
+            subject = "run_shell command" if tool == "run_shell" else f"{tool} operation"
+            lines = [
+                "Recovery warning:",
+                f"A previous {subject} was interrupted before its result could be confirmed. Its outcome and side effects are unknown.",
+                "Do not rerun the command automatically.",
+                "Inspect the current workspace and relevant state before continuing.",
+            ]
+            if command:
+                lines.append(f"Previous command (redacted): {command}")
+            return "\n".join(lines)
+
+        target = checkpoint.get("target") or {}
+        path = str(target.get("path", ""))
+        if self.recovery_state.get("target_changed") is False:
+            return "\n".join(
+                [
+                    "Recovery notice:",
+                    f"The previous {tool} operation was interrupted before its result could be confirmed.",
+                    "The target file still matches its pre-operation state.",
+                    "Re-read the target file and decide whether the operation should be retried.",
+                    f"Target file: {path}",
+                ]
+            )
+        return "\n".join(
+            [
+                "Recovery warning:",
+                f"The previous {tool} operation was interrupted and may have produced partial or complete changes to {path}.",
+                "The current file differs from its pre-operation state." if self.recovery_state.get("target_changed") is True else "The current file state could not be compared safely.",
+                "Do not repeat the previous write automatically.",
+                "Re-read and inspect the file before continuing the task.",
+            ]
+        )
 
     @staticmethod
     def remember(bucket, item, limit):
@@ -587,7 +533,7 @@ class CAgent:
 
     def _build_prompt_and_metadata(self, user_message):
         refresh = self.refresh_prefix()
-        self.resume_state = self.evaluate_resume_state()
+        self.recovery_state = self.evaluate_recovery_state()
         prompt, metadata = self.context_manager.build(user_message)
         # 这里把“这轮 prompt 是怎么拼出来的”连同缓存相关状态一起记下来，
         # 后面 trace/report 才能解释清楚：为什么这一轮 prefix 变了、缓存有没有命中。
@@ -608,10 +554,9 @@ class CAgent:
                 "workspace_changed": refresh["workspace_changed"],
                 "prefix_changed": refresh["prefix_changed"],
                 "prompt_cache_supported": bool(getattr(self.model_client, "supports_prompt_cache", False)),
-                "resume_status": self.resume_state.get("status", CHECKPOINT_NONE_STATUS),
-                "stale_summary_invalidations": int(self.resume_state.get("stale_summary_invalidations", 0)),
-                "stale_paths": list(self.resume_state.get("stale_paths", [])),
-                "runtime_identity_mismatch_fields": list(self.resume_state.get("runtime_identity_mismatch_fields", [])),
+                "recovery_status": self.recovery_state.get("status", RECOVERY_CLEAN),
+                "recovery_interrupted_tool": self.recovery_state.get("interrupted_tool", ""),
+                "recovery_target_changed": self.recovery_state.get("target_changed"),
             }
         )
         metadata.update(self.detected_secret_env_summary())
@@ -657,7 +602,8 @@ class CAgent:
             - completed work
             - failed work or failed attempts
             - excluded, impossible, or rejected approaches
-            - process notes useful for later retrieval
+            - important facts required to continue
+            - open questions
 
             Ignore:
             - duplicated tool output
@@ -667,20 +613,15 @@ class CAgent:
 
             Return ONLY valid JSON with this exact shape:
             {{
-              "checkpoint_updates": {{
-                "completed": [],
-                "failed": [],
-                "excluded": []
-              }},
-              "process_notes": [
-                {{"text": "", "tags": []}}
-              ]
+              "completed": [],
+              "failed": [],
+              "excluded": [],
+              "important_facts": [],
+              "open_questions": []
             }}
 
             Rules:
-            - completed/failed/excluded items must be short factual strings.
-            - process_notes[*].text must be one concise factual sentence.
-            - process_notes[*].tags must be short lowercase tags.
+            - Every item must be a short factual string.
             - If nothing fits a field, return an empty array.
             - Do not include markdown fences.
             - Do not include commentary.
@@ -698,57 +639,31 @@ class CAgent:
         data = json.loads(text)
         if not isinstance(data, dict):
             raise ValueError("distillation output must be a JSON object")
-        updates = data.get("checkpoint_updates")
-        notes = data.get("process_notes")
-        if not isinstance(updates, dict):
-            raise ValueError("missing checkpoint_updates")
-        if not isinstance(notes, list):
-            raise ValueError("missing process_notes")
-
-        parsed_updates = {}
-        for key in ("completed", "failed", "excluded"):
-            values = updates.get(key, [])
+        # 接受旧蒸馏器的形状以便滚动升级，但不再把内容写入 checkpoint/memory。
+        legacy_updates = data.get("checkpoint_updates")
+        source = legacy_updates if isinstance(legacy_updates, dict) else data
+        parsed = {}
+        for key in ("completed", "failed", "excluded", "important_facts", "open_questions"):
+            values = source.get(key, [])
+            if key == "important_facts" and not values:
+                legacy_notes = data.get("process_notes", [])
+                if isinstance(legacy_notes, list):
+                    values = [item.get("text", "") for item in legacy_notes if isinstance(item, dict)]
             if not isinstance(values, list):
-                raise ValueError(f"checkpoint_updates.{key} must be a list")
-            parsed_updates[key] = [str(item).strip() for item in values if str(item).strip()]
+                raise ValueError(f"{key} must be a list")
+            parsed[key] = [str(item).strip() for item in values if str(item).strip()]
+        return parsed
 
-        parsed_notes = []
-        for item in notes:
-            if not isinstance(item, dict):
-                raise ValueError("process_notes items must be objects")
-            text = str(item.get("text", "")).strip()
-            tags = item.get("tags", [])
-            if not isinstance(tags, list):
-                raise ValueError("process note tags must be a list")
-            tag_values = [str(tag).strip() for tag in tags if str(tag).strip()]
-            if text:
-                parsed_notes.append({"text": text, "tags": tag_values})
-        return {"checkpoint_updates": parsed_updates, "process_notes": parsed_notes}
-
-    def create_distillation_checkpoint(self, task_state, user_message, updates, candidate_count):
-        checkpoint = self.create_checkpoint(task_state, user_message, trigger="context_distillation")
-        checkpoint["completed"] = list(updates.get("completed", []))
-        checkpoint["failed"] = list(updates.get("failed", []))
-        checkpoint["excluded"] = list(updates.get("excluded", []))
-        checkpoint["summary"] = f"context_distillation: distilled {int(candidate_count)} history items"
-        self.session["checkpoints"]["items"][checkpoint["checkpoint_id"]] = checkpoint
-        self.session_path = self.session_store.save(self.session)
-        return checkpoint
-
-    def build_distilled_history_marker(self, item_count, updates):
-        def join_items(values):
-            return " | ".join(str(item) for item in values if str(item).strip()) or "-"
-
-        return "\n".join(
-            [
-                "[distilled-history]",
-                f"range=history[3:-27], items={int(item_count)}",
-                f"completed: {join_items(updates.get('completed', []))}",
-                f"failed: {join_items(updates.get('failed', []))}",
-                f"excluded: {join_items(updates.get('excluded', []))}",
-                "details: see Relevant memory",
-            ]
-        )
+    def build_distilled_history_marker(self, item_count, updates, source_start=3, source_end=None):
+        source_end = int(source_end) if source_end is not None else int(source_start) + int(item_count)
+        lines = ["[distilled-history]", f"source_range: history[{int(source_start)}:{source_end}]"]
+        for key in ("completed", "failed", "excluded", "important_facts", "open_questions"):
+            lines.append(f"{key}:")
+            values = [str(item) for item in updates.get(key, []) if str(item).strip()]
+            lines.extend(f"- {item}" for item in values)
+            if not values:
+                lines.append("- none")
+        return "\n".join(lines)
 
     def run_context_distillation(self, task_state, user_message, prompt_metadata):
         history_meta = dict(prompt_metadata.get("history", {}) or {})
@@ -759,8 +674,6 @@ class CAgent:
             return {"status": "skipped", "reason": "no_candidate"}
 
         original_history = list(self.session.get("history", []))
-        original_checkpoint_state = json.loads(json.dumps(self.session.get("checkpoints", {}), ensure_ascii=False))
-        original_memory = json.loads(json.dumps(self.memory.to_dict(), ensure_ascii=False))
         candidate_transcript = self.compressed_history_candidate_transcript(int(start), int(end))
         distill_prompt = self.build_history_distillation_prompt(candidate_transcript)
 
@@ -778,9 +691,6 @@ class CAgent:
                 parsed = None
         if parsed is None:
             self.session["history"] = original_history
-            self.session["checkpoints"] = original_checkpoint_state
-            self.memory.state = original_memory
-            self.session["memory"] = self.memory.to_dict()
             self.session_path = self.session_store.save(self.session)
             return {
                 "status": "failed",
@@ -791,20 +701,15 @@ class CAgent:
             }
 
         try:
-            updates = parsed["checkpoint_updates"]
-            checkpoint = self.create_distillation_checkpoint(task_state, user_message, updates, candidate_count)
-            for note in parsed["process_notes"]:
-                tags = tuple(["process", *[str(tag) for tag in note.get("tags", [])]])
-                self.memory.append_note(note["text"], tags=tags, source="context_distillation", kind="process")
-            self.session["memory"] = self.memory.to_dict()
+            distillation_id = "distill_" + uuid.uuid4().hex[:8]
             marker = {
                 "role": "assistant",
-                "content": self.build_distilled_history_marker(candidate_count, updates),
+                "content": self.build_distilled_history_marker(candidate_count, parsed, int(start), int(end)),
                 "created_at": now(),
                 "metadata": {
                     "kind": "distilled_history",
                     "items": candidate_count,
-                    "checkpoint_id": checkpoint["checkpoint_id"],
+                    "distillation_id": distillation_id,
                 },
             }
             self.session["history"] = original_history[: int(start)] + [marker] + original_history[int(end) :]
@@ -813,15 +718,14 @@ class CAgent:
                 "status": "success",
                 "candidate_count": candidate_count,
                 "retry_count": retry_count,
-                "checkpoint_id": checkpoint["checkpoint_id"],
-                "process_note_count": len(parsed["process_notes"]),
+                "distillation_id": distillation_id,
+                "source_start": int(start),
+                "source_end": int(end),
+                "source_count": candidate_count,
                 "history_replaced": True,
             }
         except Exception as exc:
             self.session["history"] = original_history
-            self.session["checkpoints"] = original_checkpoint_state
-            self.memory.state = original_memory
-            self.session["memory"] = self.memory.to_dict()
             self.session_path = self.session_store.save(self.session)
             return {
                 "status": "failed",
@@ -873,48 +777,6 @@ class CAgent:
                 summaries.append(f"modified:{path}")
         return changed_paths, summaries
 
-    def create_checkpoint(self, task_state, user_message, trigger):
-        state = self.checkpoint_state()
-        current = self.current_checkpoint()
-        checkpoint_id = "ckpt_" + uuid.uuid4().hex[:8]
-        key_files = []
-        freshness = {}
-        for path in self.memory.to_dict()["working"]["recent_files"]:
-            file_freshness = memorylib.file_freshness(path, self.root)
-            freshness[path] = file_freshness
-            key_files.append({"path": path, "freshness": file_freshness})
-        checkpoint = {
-            "checkpoint_id": checkpoint_id,
-            "parent_checkpoint_id": current.get("checkpoint_id", "") if current else "",
-            "schema_version": CHECKPOINT_SCHEMA_VERSION,
-            "created_at": now(),
-            "current_goal": str(user_message),
-            "completed": [task_state.final_answer] if task_state.final_answer else [],
-            "failed": [],
-            "excluded": [],
-            "current_blocker": "" if str(task_state.stop_reason or "") in ("", "final_answer_returned") else str(task_state.stop_reason),
-            "next_step": self.infer_next_step(task_state),
-            "key_files": key_files,
-            "freshness": freshness,
-            "summary": f"{trigger}: {clip(str(user_message), 120)}",
-            "runtime_identity": self.current_runtime_identity(),
-        }
-        state["items"][checkpoint_id] = checkpoint
-        state["current_id"] = checkpoint_id
-        task_state.checkpoint_id = checkpoint_id
-        self.session["runtime_identity"] = checkpoint["runtime_identity"]
-        self.session_path = self.session_store.save(self.session)
-        return checkpoint
-
-    def infer_next_step(self, task_state):
-        if task_state.status == "completed":
-            return "No next step recorded."
-        if task_state.stop_reason == "step_limit_reached":
-            return "Resume from the latest checkpoint and continue the task."
-        if task_state.last_tool:
-            return f"Decide the next action after {task_state.last_tool}."
-        return "Continue the task from the latest checkpoint."
-
     def update_memory_after_tool(self, name, args, result):
         """把少量高价值工具结果沉淀到 working memory。
 
@@ -945,28 +807,11 @@ class CAgent:
         if name == "read_file":
             summary = memorylib.summarize_read_result(result)
             self.memory.set_file_summary(canonical_path, summary)
-            self.memory.append_note(summary, tags=(canonical_path,), source=canonical_path)
         elif name in {"write_file", "patch_file"}:
             self.memory.invalidate_file_summary(canonical_path)
 
     def note_tool(self, name, args, result):
         self.update_memory_after_tool(name, args, result)
-
-    def record_process_note_for_tool(self, name, metadata):
-        status = str(metadata.get("tool_status", "")).strip()
-        if status not in {"partial_success", "error", "rejected"}:
-            return
-        affected_paths = [str(path).strip() for path in metadata.get("affected_paths", []) if str(path).strip()]
-        path_text = ", ".join(affected_paths) or "workspace"
-        if status == "partial_success":
-            text = f"{name} partial_success on {path_text}; inspect diff before retry"
-        elif status == "error":
-            text = f"{name} error on {path_text}; check the failure before retry"
-        else:
-            text = f"{name} rejected; choose a different action before retry"
-        tags = ["process", status, *affected_paths]
-        self.memory.append_note(text, tags=tuple(tags), source=name, kind="process")
-        self.session["memory"] = self.memory.to_dict()
 
     def reject_durable_reason(self, note_text):
         text = str(note_text or "").strip()
@@ -1029,6 +874,110 @@ class CAgent:
         self.last_durable_superseded = superseded
         return promoted, rejections, superseded
 
+    def _recovery_trace_identity(self):
+        checkpoint = self.recovery_checkpoint or {}
+        return {
+            "checkpoint_id": checkpoint.get("checkpoint_id", ""),
+            "tool": checkpoint.get("tool", ""),
+        }
+
+    def prepare_recovery_checkpoint(self, task_state, name, args):
+        """审批完成后、真正执行前，持久化副作用的未确认区间。"""
+        target = None
+        if name in {"write_file", "patch_file"}:
+            path, before = capture_file_state(args.get("path", ""), self.root)
+            target = {"path": path, "before": before}
+            args_summary = {"path": path}
+        else:
+            args_summary = {
+                "command": clip(self.redact_text(str(args.get("command", ""))), 500),
+                "timeout": int(args.get("timeout", 20)),
+            }
+        checkpoint = {
+            "schema_version": RECOVERY_SCHEMA_VERSION,
+            "checkpoint_id": "recovery_" + uuid.uuid4().hex[:8],
+            "session_id": self.session["id"],
+            "run_id": task_state.run_id,
+            "task_id": task_state.task_id,
+            "tool": name,
+            "args_summary": args_summary,
+            "target": target,
+            "created_at": now(),
+        }
+        self.recovery_store.prepare(self.session["id"], checkpoint)
+        self.recovery_checkpoint = checkpoint
+        self.recovery_state = self.evaluate_recovery_state()
+        self._last_recovery_prepared = True
+        self.emit_trace(task_state, "recovery_checkpoint_prepared", self._recovery_trace_identity())
+        return checkpoint
+
+    def clear_recovery_checkpoint(self, task_state, reason):
+        checkpoint = self.recovery_checkpoint
+        if not checkpoint:
+            return
+        identity = self._recovery_trace_identity()
+        self.recovery_store.clear(self.session["id"])
+        self.recovery_checkpoint = None
+        self.recovery_state = {
+            "status": RECOVERY_CLEAN,
+            "interrupted_tool": "",
+            "target_changed": None,
+        }
+        self.emit_trace(task_state, "recovery_checkpoint_cleared", {**identity, "reason": reason})
+
+    def recovery_blocks_tool(self, name):
+        return bool(self.recovery_checkpoint and name in SIDE_EFFECT_TOOLS)
+
+    def recovery_inspection_satisfied(self, name, args, metadata):
+        checkpoint = self.recovery_checkpoint
+        if not checkpoint or metadata.get("tool_status") != "ok":
+            return False
+        interrupted_tool = checkpoint.get("tool")
+        if interrupted_tool not in {"write_file", "patch_file"}:
+            return name in READ_ONLY_INSPECTION_TOOLS
+        if interrupted_tool not in {"write_file", "patch_file"} or name != "read_file":
+            return False
+        expected = str((checkpoint.get("target") or {}).get("path", ""))
+        try:
+            actual, _ = capture_file_state(args.get("path", ""), self.root)
+        except Exception:
+            return False
+        return actual == expected
+
+    def execute_and_record_tool(self, task_state, name, args):
+        """集中保证副作用、history 持久化和 recovery 清理的顺序。"""
+        tool_started_at = time.monotonic()
+        result = self.run_tool(name, args)
+        metadata = dict(self._last_tool_result_metadata or {})
+        self.record(
+            {
+                "role": "tool",
+                "name": name,
+                "args": args,
+                "content": result,
+                "created_at": now(),
+            }
+        )
+        self.run_store.write_task_state(task_state)
+        self.emit_trace(
+            task_state,
+            "tool_executed",
+            {
+                "name": name,
+                "args": args,
+                "result": clip(result, 500),
+                "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
+                **metadata,
+            },
+        )
+        if self._last_recovery_prepared:
+            self.clear_recovery_checkpoint(task_state, "tool_result_persisted")
+        elif self.recovery_inspection_satisfied(name, args, metadata):
+            identity = self._recovery_trace_identity()
+            self.emit_trace(task_state, "recovery_inspection_completed", {**identity, "inspection_tool": name})
+            self.clear_recovery_checkpoint(task_state, "inspection_persisted")
+        return result
+
 
 
     def ask(self, user_message):
@@ -1056,7 +1005,9 @@ class CAgent:
         self.record({"role": "user", "content": user_message, "created_at": now()})
 
         task_state = TaskState.create(run_id=self.new_run_id(), task_id=self.new_task_id(), user_request=user_message)
-        task_state.resume_status = self.resume_state.get("status", CHECKPOINT_NONE_STATUS)
+        self.recovery_state = self.evaluate_recovery_state()
+        self._run_recovery_summary = dict(self.recovery_state)
+        task_state.recovery_status = self.recovery_state.get("status", RECOVERY_CLEAN)
         self.current_task_state = task_state
         self.current_run_dir = self.run_store.start_run(task_state)
         self.emit_trace(
@@ -1067,6 +1018,19 @@ class CAgent:
                 "user_request": clip(user_message, 300),
             },
         )
+        if self.recovery_checkpoint:
+            self.emit_trace(task_state, "recovery_checkpoint_detected", self._recovery_trace_identity())
+            if self.recovery_checkpoint.get("tool") in {"write_file", "patch_file"}:
+                target = self.recovery_checkpoint.get("target") or {}
+                self.emit_trace(
+                    task_state,
+                    "recovery_target_compared",
+                    {
+                        **self._recovery_trace_identity(),
+                        "path": target.get("path", ""),
+                        "target_changed": self.recovery_state.get("target_changed"),
+                    },
+                )
 
         tool_steps = 0
         attempts = 0
@@ -1101,9 +1065,10 @@ class CAgent:
             if self.should_distill_context(prompt_metadata):
                 distillation_started_at = time.monotonic()
                 distillation_result = self.run_context_distillation(task_state, user_message, prompt_metadata)
+                event_name = "history_distilled" if distillation_result.get("status") == "success" else "history_distillation_failed"
                 self.emit_trace(
                     task_state,
-                    "context_distillation",
+                    event_name,
                     {
                         **distillation_result,
                         "duration_ms": int((time.monotonic() - distillation_started_at) * 1000),
@@ -1125,67 +1090,6 @@ class CAgent:
                     "duration_ms": int((time.monotonic() - prompt_started_at) * 1000),
                 },
             )
-            """
-            三个 checkpoint 触发条件
-            prompt 组装完后，metadata 里携带了 resume 状态信息。ask() 不直接消费这些信息，而是把异常状态转化为 checkpoint：
-            """
-
-            """
-            if resume_status == "partial-stale":
-                # 记忆层的文件摘要过期了（文件内容变了但摘要还是旧的）
-                create_checkpoint(trigger="freshness_mismatch")
-                # → 模型下一轮会看到 "[Stale paths: sample.txt]" 的提醒
-            
-            elif resume_status == "workspace-mismatch":
-                # 运行环境变了（换了模型、换了审批策略等）
-                create_checkpoint(trigger="workspace_mismatch")
-                # → 模型下一轮会看到 runtime identity 不匹配的提醒
-            
-            if budget_reductions:
-                # prompt 超预算被压缩了
-                create_checkpoint(trigger="context_reduction")
-                # → 标记"这一轮的历史已经被裁剪过"
-            """
-            if prompt_metadata.get("resume_status") == CHECKPOINT_PARTIAL_STALE_STATUS:
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="freshness_mismatch")
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "freshness_mismatch",
-                    },
-                )
-            elif prompt_metadata.get("resume_status") == CHECKPOINT_WORKSPACE_MISMATCH_STATUS:
-                self.emit_trace(
-                    task_state,
-                    "runtime_identity_mismatch",
-                    {
-                        "fields": list(prompt_metadata.get("runtime_identity_mismatch_fields", [])),
-                    },
-                )
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="workspace_mismatch")
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "workspace_mismatch",
-                    },
-                )
-            if prompt_metadata.get("budget_reductions"):
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="context_reduction")
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "context_reduction",
-                    },
-                )
             self.emit_trace(
                 task_state,
                 "model_requested",
@@ -1240,39 +1144,7 @@ class CAgent:
                 name = payload.get("name", "")
                 args = payload.get("args", {})
                 task_state.record_tool(name)
-                tool_started_at = time.monotonic()
-                result = self.run_tool(name, args)
-                self.record(
-                    {
-                        "role": "tool",
-                        "name": name,
-                        "args": args,
-                        "content": result,
-                        "created_at": now(),
-                    }
-                )
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "tool_executed",
-                    {
-                        "name": name,
-                        "args": args,
-                        "result": clip(result, 500),
-                        "duration_ms": int((time.monotonic() - tool_started_at) * 1000),
-                        **dict(self._last_tool_result_metadata or {}),
-                    },
-                )
-                checkpoint = self.create_checkpoint(task_state, user_message, trigger="tool_executed")
-                self.run_store.write_task_state(task_state)
-                self.emit_trace(
-                    task_state,
-                    "checkpoint_created",
-                    {
-                        "checkpoint_id": checkpoint["checkpoint_id"],
-                        "trigger": "tool_executed",
-                    },
-                )
+                self.execute_and_record_tool(task_state, name, args)
                 continue
 
             if kind == "retry":
@@ -1280,20 +1152,20 @@ class CAgent:
                 self.run_store.write_task_state(task_state)
                 continue
 
+            if self.recovery_checkpoint:
+                notice = (
+                    "Runtime notice: recovery_inspection_required. Complete the required read-only "
+                    "inspection and persist its result before returning a final answer."
+                )
+                self.record({"role": "assistant", "content": notice, "created_at": now()})
+                self.run_store.write_task_state(task_state)
+                continue
+
             final = (payload or raw).strip()
             self.record({"role": "assistant", "content": final, "created_at": now()})
             task_state.finish_success(final)
             self.promote_durable_memory(user_message, final)
-            checkpoint = self.create_checkpoint(task_state, user_message, trigger="run_finished")
             self.run_store.write_task_state(task_state)
-            self.emit_trace(
-                task_state,
-                "checkpoint_created",
-                {
-                    "checkpoint_id": checkpoint["checkpoint_id"],
-                    "trigger": "run_finished",
-                },
-            )
             self.emit_trace(
                 task_state,
                 "run_finished",
@@ -1324,15 +1196,6 @@ class CAgent:
         self.record({"role": "assistant", "content": final, "created_at": now()})
         self.promote_durable_memory(user_message, final)
         self.run_store.write_task_state(task_state)
-        checkpoint = self.create_checkpoint(task_state, user_message, trigger=task_state.stop_reason or "run_stopped")
-        self.emit_trace(
-            task_state,
-            "checkpoint_created",
-            {
-                "checkpoint_id": checkpoint["checkpoint_id"],
-                "trigger": task_state.stop_reason or "run_stopped",
-            },
-        )
         self.emit_trace(
             task_state,
             "run_finished",
@@ -1372,6 +1235,7 @@ class CAgent:
         工具名校验 
         """
 
+        self._last_recovery_prepared = False
         tool = self.tools.get(name)
         if tool is None:
             self._last_tool_result_metadata = {
@@ -1385,6 +1249,24 @@ class CAgent:
                 "diff_summary": [],
             }
             return f"error: unknown tool '{name}'"
+        if self.recovery_blocks_tool(name):
+            self._last_tool_result_metadata = {
+                "tool_status": "rejected",
+                "tool_error_code": "recovery_inspection_required",
+                "security_event_type": "recovery_mutation_block",
+                "risk_level": "high",
+                "read_only": False,
+                "affected_paths": [],
+                "workspace_changed": False,
+                "diff_summary": [],
+            }
+            if self.current_task_state is not None:
+                self.emit_trace(
+                    self.current_task_state,
+                    "recovery_mutation_blocked",
+                    {**self._recovery_trace_identity(), "requested_tool": name},
+                )
+            return "error: recovery_inspection_required; inspect the interrupted operation before any new mutation"
         """
         参数校验
         """
@@ -1437,6 +1319,22 @@ class CAgent:
             }
             return f"error: approval denied for {name}"
 
+        if name in SIDE_EFFECT_TOOLS and self.current_task_state is not None:
+            try:
+                self.prepare_recovery_checkpoint(self.current_task_state, name, args)
+            except Exception as exc:
+                self._last_tool_result_metadata = {
+                    "tool_status": "rejected",
+                    "tool_error_code": "recovery_prepare_failed",
+                    "security_event_type": "",
+                    "risk_level": "high",
+                    "read_only": False,
+                    "affected_paths": [],
+                    "workspace_changed": False,
+                    "diff_summary": [],
+                }
+                return f"error: unable to prepare recovery checkpoint for {name}: {exc}"
+
         before_snapshot = self.capture_workspace_snapshot() if tool["risky"] else {}
         after_snapshot = before_snapshot
         try:
@@ -1467,7 +1365,6 @@ class CAgent:
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
             }
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return result
         except Exception as exc:
             after_snapshot = self.capture_workspace_snapshot() if tool["risky"] else before_snapshot
@@ -1485,7 +1382,6 @@ class CAgent:
                 "workspace_fingerprint": self.workspace.fingerprint(),
                 "diff_summary": diff_summary,
             }
-            self.record_process_note_for_tool(name, self._last_tool_result_metadata)
             return f"error: tool {name} failed: {exc}"
 
     def repeated_tool_call(self, name, args):
@@ -1516,8 +1412,7 @@ class CAgent:
             "final_answer": task_state.final_answer,
             "tool_steps": task_state.tool_steps,
             "attempts": task_state.attempts,
-            "checkpoint_id": task_state.checkpoint_id,
-            "resume_status": task_state.resume_status,
+            "recovery": dict(self._run_recovery_summary),
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
             "durable_promotions": list(self.last_durable_promotions),

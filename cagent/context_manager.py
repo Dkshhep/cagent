@@ -47,8 +47,8 @@ DEFAULT_REDUCTION_ORDER = ("history", "relevant_memory", "memory", "prefix")
 # 顺序刻意设计：稳定的 prefix + 大块 history 放前面，让缓存切点落在 history 之后；
 # 易变的短期记忆（memory/file_summary 写操作时变、relevant_memory 每轮按 query 变）
 # 全部挪到 history 之后、current_request 之前，避免它们击穿 history 的前缀缓存。
-CHECKPOINT_SECTION = "checkpoint"
-SECTION_ORDER = ("prefix", "history", CHECKPOINT_SECTION, "memory", "relevant_memory", "current_request")
+RECOVERY_NOTICE_SECTION = "recovery_notice"
+SECTION_ORDER = ("prefix", "history", "memory", "relevant_memory", RECOVERY_NOTICE_SECTION, "current_request")
 CURRENT_REQUEST_SECTION = "current_request"
 RELEVANT_MEMORY_LIMIT = 3
 TOKEN_SAFETY_FACTOR = 1.15
@@ -268,18 +268,18 @@ class ContextManager:
             context_reduction_enabled = self.agent.feature_enabled("context_reduction")
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
-            CHECKPOINT_SECTION: "",
+            RECOVERY_NOTICE_SECTION: "",
             "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
             "history": "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
         if estimate_tokens(section_texts[CURRENT_REQUEST_SECTION]) > self.section_max["current_request"]:
             raise ValueError("current request exceeds prompt budget hard max; put large content in a file or split the request")
-        checkpoint_text = ""
-        if hasattr(self.agent, "render_checkpoint_text"):
-            checkpoint_text = str(self.agent.render_checkpoint_text() or "").strip()
-        if checkpoint_text:
-            section_texts[CHECKPOINT_SECTION] = checkpoint_text
+        recovery_notice = ""
+        if hasattr(self.agent, "render_recovery_notice"):
+            recovery_notice = str(self.agent.render_recovery_notice() or "").strip()
+        if recovery_notice:
+            section_texts[RECOVERY_NOTICE_SECTION] = recovery_notice
         selected_notes = []
         if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
             selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
@@ -405,7 +405,8 @@ class ContextManager:
             self.section_max["relevant_memory"],
         )
         request_tokens = estimate_tokens(section_texts[CURRENT_REQUEST_SECTION])
-        fixed_tokens = prefix_budget + memory_budget + relevant_budget + request_tokens
+        recovery_tokens = estimate_tokens(section_texts.get(RECOVERY_NOTICE_SECTION, ""))
+        fixed_tokens = prefix_budget + memory_budget + relevant_budget + recovery_tokens + request_tokens
         history_budget = max(self.min_history_tokens, self._input_hard_budget() - fixed_tokens)
         if "history" in self.section_budgets and self.section_budgets["history"] != DEFAULT_SECTION_BUDGETS["history"]:
             history_budget = min(history_budget, int(self.section_budgets["history"]))
@@ -428,10 +429,10 @@ class ContextManager:
         history_raw = self._raw_history_text(history)
         return {
             "prefix": SectionRender(raw=section_texts["prefix"], budget=len(section_texts["prefix"]), rendered=section_texts["prefix"], details={}),
-            CHECKPOINT_SECTION: SectionRender(
-                raw=section_texts[CHECKPOINT_SECTION],
-                budget=len(section_texts[CHECKPOINT_SECTION]),
-                rendered=section_texts[CHECKPOINT_SECTION],
+            RECOVERY_NOTICE_SECTION: SectionRender(
+                raw=section_texts[RECOVERY_NOTICE_SECTION],
+                budget=len(section_texts[RECOVERY_NOTICE_SECTION]),
+                rendered=section_texts[RECOVERY_NOTICE_SECTION],
                 details={},
             ),
             "memory": SectionRender(raw=section_texts["memory"], budget=len(section_texts["memory"]), rendered=section_texts["memory"], details={}),
@@ -853,9 +854,9 @@ class ContextManager:
             for section in [
                 rendered["prefix"].rendered,
                 rendered["history"].rendered,
-                rendered[CHECKPOINT_SECTION].rendered,
                 rendered["memory"].rendered,
                 rendered["relevant_memory"].rendered,
+                rendered[RECOVERY_NOTICE_SECTION].rendered,
                 rendered[CURRENT_REQUEST_SECTION].rendered,
             ]
             if str(section).strip()

@@ -1,16 +1,16 @@
 # CAgent
 
-CAgent 是一个面向本地代码仓库的轻量级 Coding Agent Harness。它运行在终端中，能够读取当前工作区、调用受约束的本地工具、维护会话状态、生成 checkpoint，并把每次运行的过程工件落盘，方便后续恢复、审计和复盘。
+CAgent 是一个面向本地代码仓库的轻量级 Coding Agent Harness。它运行在终端中，能够读取当前工作区、调用受约束的本地工具、维护会话状态，并用最小 recovery checkpoint 保护未确认的副作用操作。
 
-这个项目的重点不是做一个聊天窗口，而是实现一个完整的本地代码 agent runtime：统一模型接入、上下文管理、工具执行、审批控制、短期/长期记忆、checkpoint 恢复和运行工件管理。
+这个项目的重点不是做一个聊天窗口，而是实现一个完整的本地代码 agent runtime：统一模型接入、上下文管理、工具执行、审批控制、短期/长期记忆、副作用恢复和运行工件管理。
 
 ## 项目亮点
 
-- **Agent Harness Runtime**：串联用户请求、prompt 组装、模型调用、工具执行、记忆更新、checkpoint 创建和 report 落盘的完整控制循环。
+- **Agent Harness Runtime**：串联用户请求、prompt 组装、模型调用、工具执行、history 持久化和 report 落盘的完整控制循环。
 - **多模型后端接入**：支持 Ollama、OpenAI-compatible Responses API、Anthropic-compatible Messages API，以及 DeepSeek 的 Anthropic-compatible endpoint。
 - **受约束工具系统**：内置 7 类工具能力，包括 `list_files`、`read_file`、`search`、`run_shell`、`write_file`、`patch_file` 和只读 `delegate`。
-- **上下文与记忆管理**：在 token 预算内组合 workspace prefix、历史对话、工作记忆、相关记忆、checkpoint 状态和当前请求。
-- **Checkpoint 恢复机制**：记录可恢复任务状态、关键文件 freshness、runtime identity、过期文件摘要和上下文压缩触发原因。
+- **上下文与记忆管理**：在 token 预算内组合 workspace prefix、历史对话、工作记忆、相关记忆、临时 recovery notice 和当前请求；压缩历史以自包含的 `distilled-history` marker 留在 history 中。
+- **Recovery Checkpoint**：仅在 `write_file`、`patch_file` 或 `run_shell` 已进入执行但结果尚未可靠写入 history 时存在；恢复后强制先做只读调查，禁止盲目重放副作用。
 - **可复盘运行工件**：每次运行都会在 `.cagent/runs/` 下写出 `task_state.json`、`trace.jsonl` 和 `report.json`。
 - **MCP 扩展能力**：支持从 `.mcp.json` 加载外部 MCP server，并把 MCP 工具暴露给顶层 agent。
 
@@ -18,7 +18,9 @@ CAgent 是一个面向本地代码仓库的轻量级 Coding Agent Harness。它�
 
 CAgent 的核心模块如下：
 
-- `cagent.runtime.CAgent`：主控制循环，负责组装 prompt、解析模型输出、校验并执行工具、记录 history、更新 memory、创建 checkpoint、写入 trace/report。
+- `cagent.runtime.CAgent`：主控制循环，负责组装 prompt、解析模型输出、校验并执行工具、记录 history、更新 memory、管理 recovery guard、写入 trace/report。
+- `cagent.recovery.RecoveryCheckpointStore`：管理 session 级 active recovery checkpoint，并比较文件工具执行前后的目标状态。
+- `cagent.storage.write_json_atomic`：为 session、recovery、task state 和 report 提供 fsync + replace 的原子 JSON 写入。
 - `cagent.models`：模型适配层，OpenAI-compatible、Anthropic-compatible 和 DeepSeek-compatible 后端。
 - `cagent.context_manager.ContextManager`：上下文组装与预算控制，负责按 section 渲染 prompt 并在超预算时压缩低优先级内容。
 - `cagent.memory.LayeredMemory`：工作记忆层，维护任务摘要、最近文件、文件摘要、临时笔记和 durable memory topics。
@@ -35,8 +37,9 @@ CAgent 的核心模块如下：
   -> 调用模型
   -> 解析 final answer 或 tool call
   -> 校验工具参数与审批策略
-  -> 执行工具
-  -> 更新 memory / checkpoint / trace
+  -> 副作用工具执行前原子写 recovery checkpoint
+  -> 执行工具并将结果原子写入 session/history
+  -> 清理 recovery checkpoint，更新 memory / task state / trace
   -> 循环直到 final answer 或命中停止条件
 ```
 
@@ -186,6 +189,7 @@ CAgent 的本地状态默认写在仓库下的 `.cagent/`：
 .cagent/
   sessions/
     <session_id>.json
+    <session_id>.recovery.json  # 仅在副作用结果未确认时存在
   runs/
     <run_id>/
       task_state.json
@@ -196,8 +200,9 @@ CAgent 的本地状态默认写在仓库下的 `.cagent/`：
     topics/
 ```
 
-- `sessions/`：保存可恢复的会话历史、工作记忆、checkpoint 和 runtime identity。
+- `<session_id>.json`：保存正常 resume 的事实源，包括完整会话 history 和工作记忆。
+- `<session_id>.recovery.json`：只标记一个结果尚未确认的副作用工具；正常完成时不存在。
 - `task_state.json`：保存当前任务的生命周期状态。
 - `trace.jsonl`：逐条记录运行过程事件，适合排查 agent 为什么做了某个动作。
-- `report.json`：保存最终运行摘要、prompt metadata、checkpoint id、工具统计和敏感信息脱敏结果。
+- `report.json`：保存最终运行摘要、当次 recovery 摘要、prompt metadata、工具统计和敏感信息脱敏结果。
 - `memory/`：保存由模型显式沉淀的长期记忆主题。

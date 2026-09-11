@@ -44,20 +44,20 @@ def test_context_manager_assembles_sections_in_expected_order(tmp_path):
     assert prompt.index("Memory:") < prompt.index("Relevant memory:")
     assert prompt.index("Relevant memory:") < prompt.index("Current user request:")
     assert prompt.rstrip().endswith("Current user request:\nWhere is the deploy key?")
-    assert metadata["section_order"] == ["prefix", "history", "checkpoint", "memory", "relevant_memory", "current_request"]
+    assert metadata["section_order"] == ["prefix", "history", "memory", "relevant_memory", "recovery_notice", "current_request"]
 
 
-def test_context_manager_places_checkpoint_after_history_for_cache_prefix(tmp_path):
+def test_context_manager_places_recovery_notice_near_current_request(tmp_path):
     agent = build_agent(tmp_path, [])
     agent.record({"role": "user", "content": "old request", "created_at": "2026-04-07T09:59:00+00:00"})
-    agent.render_checkpoint_text = lambda: "Task checkpoint:\n- Next step: keep history prefix stable"
+    agent.render_recovery_notice = lambda: "Recovery warning:\nInspect before continuing"
 
     prompt, metadata = ContextManager(agent).build("Continue")
 
-    assert prompt.index("Transcript:") < prompt.index("Task checkpoint:")
-    assert prompt.index("Task checkpoint:") < prompt.index("Memory:")
+    assert prompt.index("Relevant memory:") < prompt.index("Recovery warning:")
+    assert prompt.index("Recovery warning:") < prompt.index("Current user request:")
     assert metadata["sections"]["prefix"]["rendered_chars"] == len(agent.prefix)
-    assert metadata["sections"]["checkpoint"]["rendered_chars"] > 0
+    assert metadata["sections"]["recovery_notice"]["rendered_chars"] > 0
 
 
 def test_context_manager_reduces_relevant_memory_before_history_and_preserves_newer_context(tmp_path):

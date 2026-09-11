@@ -62,14 +62,14 @@ def test_task_state_snapshot_keeps_final_answer():
     assert snapshot["stop_reason"] == STOP_REASON_FINAL_ANSWER_RETURNED
 
 
-def test_task_state_snapshot_keeps_checkpoint_reference_without_body():
+def test_task_state_snapshot_keeps_recovery_status_without_checkpoint_body():
     state = TaskState.create(run_id="run_006", task_id="task_006", user_request="Resume the task.")
-    state.checkpoint_id = "ckpt_001"
-    state.resume_status = "full-valid"
+    state.recovery_status = "inspection_required"
 
     snapshot = state.to_dict()
 
-    assert snapshot["checkpoint_id"] == "ckpt_001"
-    assert snapshot["resume_status"] == "full-valid"
+    assert snapshot["recovery_status"] == "inspection_required"
+    assert "checkpoint_id" not in snapshot
+    assert "resume_status" not in snapshot
     assert "current_goal" not in snapshot
     assert "next_step" not in snapshot

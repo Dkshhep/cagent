@@ -73,13 +73,13 @@
       "category": "tool-boundary"
     },
     {
-      "id": "context_reduction_checkpoint",
-      "prompt": "Finish the README update after prompt compression creates a checkpoint.",
+      "id": "context_reduction_no_recovery",
+      "prompt": "Finish the README check after prompt compression without creating a recovery checkpoint.",
       "fixture_repo": "tests/fixtures/bench_repo_readme",
       "allowed_tools": ["read_file"],
       "step_budget": 2,
-      "expected_artifact": "README.md remains available while context reduction creates a checkpoint",
-      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.cagent/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; assert report['checkpoint_id']; assert any(event.get('event') == 'checkpoint_created' and event.get('trigger') == 'context_reduction' for event in trace)\"",
+      "expected_artifact": "README.md remains available while context reduction stays recovery-clean",
+      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.cagent/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; assert report['recovery']['status'] == 'clean'; assert not any(event.get('event', '').startswith('recovery_checkpoint_') for event in trace)\"",
       "category": "recovery",
       "setup": {
         "kind": "context_reduction",
@@ -95,13 +95,13 @@
       }
     },
     {
-      "id": "freshness_reanchor_resume",
-      "prompt": "Resume the stale benchmark task and finish without trusting the old summary.",
+      "id": "stale_summary_invalidation",
+      "prompt": "Continue the benchmark task without trusting the stale file summary.",
       "fixture_repo": "tests/fixtures/bench_repo_patch",
       "allowed_tools": ["read_file"],
       "step_budget": 3,
-      "expected_artifact": "sample.txt exists after stale freshness recovery",
-      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.cagent/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; assert report['prompt_metadata']['resume_status'] == 'partial-stale'; assert any(event.get('event') == 'checkpoint_created' and event.get('trigger') == 'freshness_mismatch' for event in trace)\"",
+      "expected_artifact": "sample.txt exists and stale summary is invalidated without recovery",
+      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); session = json.loads(next(Path('.cagent/sessions').glob('*.json')).read_text(encoding='utf-8')); assert report['recovery']['status'] == 'clean'; assert 'sample.txt' not in session['memory']['file_summaries']\"",
       "category": "recovery",
       "setup": {
         "kind": "freshness_mismatch",
@@ -111,13 +111,13 @@
       }
     },
     {
-      "id": "workspace_mismatch_resume",
-      "prompt": "Resume after benchmark workspace drift and rebuild runtime state.",
+      "id": "legacy_checkpoint_ignored",
+      "prompt": "Continue after loading a session that contains a legacy checkpoint.",
       "fixture_repo": "tests/fixtures/bench_repo_readme",
       "allowed_tools": ["read_file"],
       "step_budget": 3,
-      "expected_artifact": "README.md exists after workspace mismatch recovery",
-      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.cagent/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; assert report['prompt_metadata']['resume_status'] == 'workspace-mismatch'; assert any(event.get('event') == 'runtime_identity_mismatch' for event in trace)\"",
+      "expected_artifact": "README.md exists and legacy checkpoint does not activate recovery",
+      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); trace = [json.loads(line) for line in next(Path('.cagent/runs').glob('*/trace.jsonl')).read_text(encoding='utf-8').splitlines()]; assert report['recovery']['status'] == 'clean'; assert not any(event.get('event') == 'recovery_checkpoint_detected' for event in trace)\"",
       "category": "recovery",
       "setup": {
         "kind": "workspace_mismatch"

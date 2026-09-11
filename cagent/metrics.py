@@ -1,11 +1,12 @@
 import json
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import load_project_env, provider_env
-from .context_manager import CHECKPOINT_SECTION, CURRENT_REQUEST_SECTION, ContextManager, estimate_tokens
+from .context_manager import RECOVERY_NOTICE_SECTION, CURRENT_REQUEST_SECTION, ContextManager, estimate_tokens
+from .recovery import capture_file_state
 from .evaluator import run_fixed_benchmark
 from .models import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
 from .runtime import CAgent, SessionStore
@@ -603,9 +604,9 @@ def _seed_context_compression_v3_history(agent, history_count, tool_density):
                 name = "run_shell"
                 args = {"command": "pytest tests/test_context_manager.py -q"}
                 content = (
-                    "pytest failed because marker format missed details line\n"
+                    "pytest failed because the distilled marker was not self-contained\n"
                     + long_tool
-                    + "\nTAIL: AssertionError expected details: see Relevant memory"
+                    + "\nTAIL: AssertionError expected important_facts in distilled history"
                 )
             agent.record({"role": "tool", "name": name, "args": args, "content": content, "created_at": f"2026-06-23T10:{index:02d}:00+00:00"})
             continue
@@ -614,7 +615,7 @@ def _seed_context_compression_v3_history(agent, history_count, tool_density):
         if index == 4:
             content = "Completed: added token-aware head-tail clipping for old tool results. " + ("completed detail " * 90)
         elif index == 6:
-            content = "Failed: pytest failed before the distilled marker included the details line. " + ("failed detail " * 90)
+            content = "Failed: pytest failed before the distilled marker became self-contained. " + ("failed detail " * 90)
         elif index == 7:
             content = "Excluded: do not use a subagent for deterministic compression metrics. " + ("excluded detail " * 90)
         elif index == 10:
@@ -649,53 +650,26 @@ def _apply_deterministic_context_distillation(agent, prompt_metadata, user_messa
     end = history_meta.get("distillation_candidate_end")
     count = int(history_meta.get("distillation_candidate_count", 0))
     if start is None or end is None or count <= 0:
-        return {"applied": False, "checkpoint_created": False, "process_note_count": 0, "distilled_marker_count": 0}
+        return {"applied": False, "distillation_applied": False, "distilled_marker_count": 0}
 
     history = list(agent.session.get("history", []))
     candidate = history[int(start) : int(end)]
     updates = _extract_stub_facts(candidate)
     if not any(updates.values()):
         updates["completed"] = [f"Distilled {count} middle history items for {config_id}."]
-
-    checkpoint_id = f"ckpt_stub_{config_id.replace('-', '_')}"
-    checkpoint = {
-        "checkpoint_id": checkpoint_id,
-        "parent_checkpoint_id": "",
-        "schema_version": "phase1-v1",
-        "created_at": datetime.utcnow().isoformat() + "Z",
-        "current_goal": str(user_message),
-        "completed": list(updates.get("completed", [])),
-        "failed": list(updates.get("failed", [])),
-        "excluded": list(updates.get("excluded", [])),
-        "current_blocker": "",
-        "next_step": "No next step recorded.",
-        "key_files": [],
-        "freshness": {},
-        "summary": f"context_compression_v3_stub: distilled {count} history items",
-        "runtime_identity": agent.current_runtime_identity(),
-    }
-    checkpoints = agent.session.setdefault("checkpoints", {"current_id": "", "items": {}})
-    checkpoints.setdefault("items", {})[checkpoint_id] = checkpoint
-    checkpoints["current_id"] = checkpoint_id
-
-    note_count = 0
-    for key in ("completed", "failed", "excluded"):
-        values = updates.get(key, [])
-        if values:
-            agent.memory.append_note(values[0], tags=("process", "context-compression-v3", key), source="context_compression_v3_stub", kind="process")
-            note_count = 1
-            break
-    agent.session["memory"] = agent.memory.to_dict()
+    updates["important_facts"] = []
+    updates["open_questions"] = []
+    distillation_id = f"distill_stub_{config_id.replace('-', '_')}"
 
     marker = {
         "role": "assistant",
-        "content": agent.build_distilled_history_marker(count, updates),
+        "content": agent.build_distilled_history_marker(count, updates, int(start), int(end)),
         "created_at": datetime.utcnow().isoformat() + "Z",
-        "metadata": {"kind": "distilled_history", "items": count, "checkpoint_id": checkpoint_id},
+        "metadata": {"kind": "distilled_history", "items": count, "distillation_id": distillation_id},
     }
     agent.session["history"] = history[: int(start)] + [marker] + history[int(end) :]
     agent.session_path = agent.session_store.save(agent.session)
-    return {"applied": True, "checkpoint_created": True, "process_note_count": note_count, "distilled_marker_count": 1}
+    return {"applied": True, "distillation_applied": True, "distilled_marker_count": 1}
 
 
 def _context_compression_variant_metrics(agent, user_message, variant_name, raw_tokens=None, v1_tokens=None, config_id=""):
@@ -708,7 +682,7 @@ def _context_compression_variant_metrics(agent, user_message, variant_name, raw_
 
     with _temporary_feature_flags(agent, updates):
         prompt, metadata = agent._build_prompt_and_metadata(user_message)
-        stub = {"applied": False, "checkpoint_created": False, "process_note_count": 0, "distilled_marker_count": 0}
+        stub = {"applied": False, "distillation_applied": False, "distilled_marker_count": 0}
         if variant_name == "compressed_v2_stub_distill":
             stub = _apply_deterministic_context_distillation(agent, metadata, user_message, config_id)
             if stub["applied"]:
@@ -731,8 +705,7 @@ def _context_compression_variant_metrics(agent, user_message, variant_name, raw_
         "current_request_preserved": prompt.endswith(f"Current user request:\n{user_message}"),
         "distillation_candidate_count": int(history_meta.get("distillation_candidate_count", 0)),
         "distilled_marker_count": int(stub["distilled_marker_count"]),
-        "checkpoint_created": bool(stub["checkpoint_created"]),
-        "process_note_count": int(stub["process_note_count"]),
+        "distillation_applied": bool(stub["distillation_applied"]),
         "collapsed_duplicate_tools": int(history_meta.get("collapsed_duplicate_tools", 0)) + int(history_meta.get("collapsed_duplicate_reads", 0)),
         "head_tail_clipped_tool_count": int(history_meta.get("head_tail_clipped_tool_count", 0)),
         "recent_tool_clipped_count": int(history_meta.get("recent_tool_clipped_count", 0)),
@@ -806,7 +779,7 @@ def run_context_compression_v3_matrix(repetitions=3):
             "min_v2_compression_ratio": min((item["compression_ratio_vs_raw"] for item in v2), default=0.0),
             "avg_v2_incremental_ratio_vs_v1": _safe_mean(item["v2_incremental_ratio_vs_v1"] for item in v2),
             "current_request_preserved_rate": _safe_ratio(sum(1 for item in v2 if item["current_request_preserved"]), len(v2)),
-            "distillation_success_rate": _safe_ratio(sum(1 for item in v2 if item["checkpoint_created"]), len(v2)),
+            "distillation_success_rate": _safe_ratio(sum(1 for item in v2 if item["distillation_applied"]), len(v2)),
             "configs_with_marker_rate": _safe_ratio(sum(1 for item in v2 if item["distilled_marker_count"] > 0), len(v2)),
         },
     }
@@ -926,7 +899,7 @@ def _render_prompt_cache_sections(agent, user_message):
     selected_notes = agent.memory.retrieval_candidates(user_message, limit=3)
     section_texts = {
         "prefix": str(agent.prefix),
-        CHECKPOINT_SECTION: "",
+        RECOVERY_NOTICE_SECTION: "",
         "memory": str(agent.memory_text()),
         "history": "",
         CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
@@ -1955,299 +1928,6 @@ def _write_json_artifact(path, payload):
     return payload
 
 
-class _RecoveryScenarioModelClient(FakeModelClient):
-    def __init__(self, required_fragments, success_answer):
-        super().__init__([])
-        self.required_fragments = [str(fragment).lower() for fragment in required_fragments]
-        self.success_answer = str(success_answer)
-
-    def complete(self, prompt, max_new_tokens, **kwargs):
-        del max_new_tokens, kwargs
-        self.prompts.append(prompt)
-        self.last_completion_metadata = {}
-        prompt_lower = str(prompt).lower()
-        if all(fragment in prompt_lower for fragment in self.required_fragments):
-            return f"<final>{self.success_answer}</final>"
-        return "<final>missing recovery state.</final>"
-
-
-RECOVERY_ABLATION_TASKS = [
-    {
-        "id": "checkpoint_resume_goal",
-        "category": "checkpoint_resume",
-        "setup": "checkpoint_resume",
-        "required_fragments": ["task checkpoint:", "current goal: resume the benchmark task", "next step: apply the locked change"],
-    },
-    {
-        "id": "checkpoint_resume_files",
-        "category": "checkpoint_resume",
-        "setup": "checkpoint_resume",
-        "required_fragments": ["task checkpoint:", "current goal: continue from the latest benchmark checkpoint", "key files: sample.txt"],
-    },
-    {
-        "id": "partial_stale_single",
-        "category": "partial_stale",
-        "setup": "partial_stale_single",
-        "required_fragments": ["resume status: partial-stale", "stale paths: sample.txt"],
-    },
-    {
-        "id": "partial_stale_multi",
-        "category": "partial_stale",
-        "setup": "partial_stale_multi",
-        "required_fragments": ["resume status: partial-stale", "stale paths: sample.txt, notes.txt"],
-    },
-    {
-        "id": "workspace_mismatch_fingerprint",
-        "category": "workspace_mismatch",
-        "setup": "workspace_mismatch",
-        "required_fragments": ["resume status: workspace-mismatch", "current goal: recover after workspace drift"],
-    },
-    {
-        "id": "workspace_mismatch_runtime",
-        "category": "workspace_mismatch",
-        "setup": "workspace_mismatch",
-        "required_fragments": ["resume status: workspace-mismatch", "next step: rebuild runtime state from a fresh checkpoint"],
-    },
-    {
-        "id": "schema_mismatch_version",
-        "category": "schema_mismatch",
-        "setup": "schema_mismatch",
-        "required_fragments": ["resume status: schema-mismatch"],
-    },
-    {
-        "id": "schema_mismatch_missing",
-        "category": "schema_mismatch",
-        "setup": "no_checkpoint",
-        "required_fragments": ["resume status: no-checkpoint"],
-    },
-    {
-        "id": "partial_success_shell",
-        "category": "partial_success_recovery",
-        "setup": "partial_success_shell",
-        "required_fragments": ["current blocker: tool_partial_success", "next step: inspect the diff before retry"],
-    },
-    {
-        "id": "partial_success_tool",
-        "category": "partial_success_recovery",
-        "setup": "partial_success_tool",
-        "required_fragments": ["current blocker: tool_failed", "next step: retry after checking the workspace state"],
-    },
-]
-
-
-def _build_recovery_agent(workspace_root, required_fragments):
-    workspace = WorkspaceContext.build(workspace_root)
-    store = SessionStore(workspace_root / ".cagent" / "sessions")
-    return CAgent(
-        model_client=_RecoveryScenarioModelClient(required_fragments, "recovery state restored."),
-        workspace=workspace,
-        session_store=store,
-        approval_policy="auto",
-        max_steps=4,
-    )
-
-
-def _apply_recovery_setup(agent, task, workspace_root):
-    setup = task["setup"]
-    workspace_root = Path(workspace_root)
-    (workspace_root / "sample.txt").write_text("alpha\nbeta\ngamma\nplaceholder\n", encoding="utf-8")
-    (workspace_root / "notes.txt").write_text("note-one\nnote-two\n", encoding="utf-8")
-    agent.session["memory"] = agent.memory.to_dict()
-
-    if setup == "checkpoint_resume":
-        agent.memory.remember_file("sample.txt")
-        agent.session["memory"] = agent.memory.to_dict()
-        agent.session["checkpoints"] = {
-            "current_id": "ckpt_resume",
-            "items": {
-                "ckpt_resume": {
-                    "checkpoint_id": "ckpt_resume",
-                    "parent_checkpoint_id": "",
-                    "schema_version": "phase1-v1",
-                    "created_at": "2026-04-15T08:00:00+00:00",
-                    "current_goal": "Resume the benchmark task" if task["id"] == "checkpoint_resume_goal" else "Continue from the latest benchmark checkpoint",
-                    "completed": ["Read sample.txt"],
-                    "excluded": [],
-                    "current_blocker": "",
-                    "next_step": "Apply the locked change" if task["id"] == "checkpoint_resume_goal" else "Continue from remembered file anchors",
-                    "key_files": [{"path": "sample.txt", "freshness": None}],
-                    "freshness": {},
-                    "summary": "checkpoint resume benchmark",
-                    "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
-                }
-            },
-        }
-        if task["id"] == "checkpoint_resume_files":
-            agent.session["checkpoints"]["items"]["ckpt_resume"]["key_files"] = [{"path": "sample.txt", "freshness": None}]
-        agent.session_store.save(agent.session)
-        return
-
-    if setup in {"partial_stale_single", "partial_stale_multi"}:
-        agent.memory.set_file_summary("sample.txt", "sample.txt: cached benchmark summary")
-        agent.memory.remember_file("sample.txt")
-        sample_freshness = agent.memory.to_dict()["file_summaries"]["sample.txt"]["freshness"]
-        key_files = [{"path": "sample.txt", "freshness": sample_freshness}]
-        freshness = {"sample.txt": sample_freshness}
-        if setup == "partial_stale_multi":
-            agent.memory.set_file_summary("notes.txt", "notes.txt: cached note summary")
-            agent.memory.remember_file("notes.txt")
-            notes_freshness = agent.memory.to_dict()["file_summaries"]["notes.txt"]["freshness"]
-            key_files.append({"path": "notes.txt", "freshness": notes_freshness})
-            freshness["notes.txt"] = notes_freshness
-        agent.session["memory"] = agent.memory.to_dict()
-        agent.session["checkpoints"] = {
-            "current_id": "ckpt_stale",
-            "items": {
-                "ckpt_stale": {
-                    "checkpoint_id": "ckpt_stale",
-                    "parent_checkpoint_id": "",
-                    "schema_version": "phase1-v1",
-                    "created_at": "2026-04-15T08:00:00+00:00",
-                    "current_goal": "Recover from stale benchmark summaries",
-                    "completed": [],
-                    "excluded": [],
-                    "current_blocker": "",
-                    "next_step": "Re-anchor the stale summaries",
-                    "key_files": key_files,
-                    "freshness": freshness,
-                    "summary": "partial stale benchmark",
-                    "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
-                }
-            },
-        }
-        agent.session_store.save(agent.session)
-        (workspace_root / "sample.txt").write_text("alpha\nbeta\nstale-shifted\nplaceholder\n", encoding="utf-8")
-        if setup == "partial_stale_multi":
-            (workspace_root / "notes.txt").write_text("note-one\nnote-two-shifted\n", encoding="utf-8")
-        return
-
-    if setup == "workspace_mismatch":
-        agent.session["checkpoints"] = {
-            "current_id": "ckpt_workspace",
-            "items": {
-                "ckpt_workspace": {
-                    "checkpoint_id": "ckpt_workspace",
-                    "parent_checkpoint_id": "",
-                    "schema_version": "phase1-v1",
-                    "created_at": "2026-04-15T08:00:00+00:00",
-                    "current_goal": "Recover after workspace drift",
-                    "completed": [],
-                    "excluded": [],
-                    "current_blocker": "",
-                    "next_step": "Rebuild runtime state from a fresh checkpoint",
-                    "key_files": [],
-                    "freshness": {},
-                    "summary": "workspace mismatch benchmark",
-                    "runtime_identity": {"workspace_fingerprint": "outdated-workspace-fingerprint"},
-                }
-            },
-        }
-        agent.session_store.save(agent.session)
-        return
-
-    if setup == "schema_mismatch":
-        agent.session["checkpoints"] = {
-            "current_id": "ckpt_schema",
-            "items": {
-                "ckpt_schema": {
-                    "checkpoint_id": "ckpt_schema",
-                    "parent_checkpoint_id": "",
-                    "schema_version": "legacy-v0",
-                    "created_at": "2026-04-15T08:00:00+00:00",
-                    "current_goal": "Recover after schema mismatch",
-                    "completed": [],
-                    "excluded": [],
-                    "current_blocker": "",
-                    "next_step": "Migrate the stale checkpoint",
-                    "key_files": [],
-                    "freshness": {},
-                    "summary": "schema mismatch benchmark",
-                    "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
-                }
-            },
-        }
-        agent.session_store.save(agent.session)
-        return
-
-    if setup == "no_checkpoint":
-        agent.session.pop("checkpoints", None)
-        agent.session_store.save(agent.session)
-        return
-
-    if setup in {"partial_success_shell", "partial_success_tool"}:
-        blocker = "tool_partial_success" if setup == "partial_success_shell" else "tool_failed"
-        next_step = "Inspect the diff before retry" if setup == "partial_success_shell" else "Retry after checking the workspace state"
-        agent.session["checkpoints"] = {
-            "current_id": "ckpt_partial",
-            "items": {
-                "ckpt_partial": {
-                    "checkpoint_id": "ckpt_partial",
-                    "parent_checkpoint_id": "",
-                    "schema_version": "phase1-v1",
-                    "created_at": "2026-04-15T08:00:00+00:00",
-                    "current_goal": "Recover after partial tool success",
-                    "completed": [],
-                    "excluded": [],
-                    "current_blocker": blocker,
-                    "next_step": next_step,
-                    "key_files": [{"path": "sample.txt", "freshness": None}],
-                    "freshness": {},
-                    "summary": "partial success benchmark",
-                    "runtime_identity": {"workspace_fingerprint": agent.workspace.fingerprint()},
-                }
-            },
-        }
-        agent.session_store.save(agent.session)
-
-
-def _run_recovery_task_variant(task, variant):
-    with tempfile.TemporaryDirectory(prefix="cagent-recovery-ablation-") as temp_dir:
-        workspace_root = Path(temp_dir)
-        (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
-        agent = _build_recovery_agent(workspace_root, task["required_fragments"])
-        _apply_recovery_setup(agent, task, workspace_root)
-        if variant == "resume_disabled":
-            agent.session.pop("checkpoints", None)
-            agent.session_store.save(agent.session)
-        final_answer = agent.ask("Continue the recovery task.")
-        report = agent.run_store.load_report(agent.current_task_state.run_id)
-        trace = [
-            json.loads(line)
-            for line in agent.run_store.trace_path(agent.current_task_state).read_text(encoding="utf-8").splitlines()
-        ]
-        resume_status = str(report.get("prompt_metadata", {}).get("resume_status", ""))
-        stale_reanchored = any(
-            event.get("event") == "checkpoint_created" and event.get("trigger") == "freshness_mismatch"
-            for event in trace
-        )
-        workspace_drift_detected = any(event.get("event") == "runtime_identity_mismatch" for event in trace)
-        invalid_resume = task["category"] in {"partial_stale", "workspace_mismatch", "schema_mismatch"}
-        return {
-            "task_id": task["id"],
-            "category": task["category"],
-            "variant": variant,
-            "resume_status": resume_status,
-            "resume_succeeded": final_answer == "recovery state restored.",
-            "stale_reanchored": stale_reanchored,
-            "workspace_drift_detected": workspace_drift_detected,
-            "false_accept": invalid_resume and resume_status == "full-valid",
-            "final_answer": final_answer,
-        }
-
-
-def _recovery_variant_summary(rows):
-    rows = list(rows)
-    stale_rows = [row for row in rows if row["category"] == "partial_stale"]
-    drift_rows = [row for row in rows if row["category"] == "workspace_mismatch"]
-    invalid_rows = [row for row in rows if row["category"] in {"partial_stale", "workspace_mismatch", "schema_mismatch"}]
-    return {
-        "resume_success_rate": _safe_ratio(sum(1 for row in rows if row["resume_succeeded"]), len(rows)),
-        "stale_reanchor_rate": _safe_ratio(sum(1 for row in stale_rows if row["stale_reanchored"]), len(stale_rows)),
-        "workspace_drift_detection_rate": _safe_ratio(sum(1 for row in drift_rows if row["workspace_drift_detected"]), len(drift_rows)),
-        "resume_false_accept_rate": _safe_ratio(sum(1 for row in invalid_rows if row["false_accept"]), len(invalid_rows)),
-    }
-
-
 def run_context_ablation_v2(artifact_path=DEFAULT_CONTEXT_ABLATION_V2_PATH, repetitions=5):
     payload = run_context_stress_matrix(repetitions=repetitions)
     artifact = {
@@ -2308,24 +1988,90 @@ def run_memory_ablation_v2(artifact_path=DEFAULT_MEMORY_ABLATION_V2_PATH, repeti
 
 
 def run_recovery_ablation_v2(artifact_path=DEFAULT_RECOVERY_ABLATION_V2_PATH, repetitions=3):
-    repetitions = int(repetitions)
-    variants = {"resume_enabled": [], "resume_disabled": []}
-    for task in RECOVERY_ABLATION_TASKS:
-        for _ in range(repetitions):
-            for variant in variants:
-                variants[variant].append(_run_recovery_task_variant(task, variant))
+    """用真实 recovery 文件和运行时护栏度量恢复安全性。"""
+    rows = []
+    for repetition in range(int(repetitions)):
+        with tempfile.TemporaryDirectory(prefix="cagent-recovery-metrics-") as temp_dir:
+            workspace_root = Path(temp_dir)
+            (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
+            (workspace_root / "sample.txt").write_text("before\n", encoding="utf-8")
+            workspace = WorkspaceContext.build(workspace_root)
+            store = SessionStore(workspace_root / ".cagent" / "sessions")
+            original = CAgent(FakeModelClient([]), workspace, store, approval_policy="auto")
+            path, before = capture_file_state("sample.txt", workspace_root)
+            checkpoint = {
+                "schema_version": 1,
+                "checkpoint_id": f"recovery_metric_{repetition}",
+                "session_id": original.session["id"],
+                "run_id": "run_interrupted",
+                "task_id": "task_interrupted",
+                "tool": "patch_file",
+                "args_summary": {"path": path},
+                "target": {"path": path, "before": before},
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            original.recovery_store.prepare(original.session["id"], checkpoint)
+            (workspace_root / "sample.txt").write_text("after\n", encoding="utf-8")
+            resumed = CAgent.from_session(
+                FakeModelClient(
+                    [
+                        '<tool name="patch_file" path="sample.txt"><old_text>after</old_text><new_text>duplicated</new_text></tool>',
+                        '<tool>{"name":"read_file","args":{"path":"sample.txt"}}</tool>',
+                        "<final>inspected</final>",
+                    ]
+                ),
+                workspace,
+                store,
+                original.session["id"],
+                approval_policy="auto",
+            )
+            resumed.ask("Continue after interruption.")
+            trace = [
+                json.loads(line)
+                for line in resumed.run_store.trace_path(resumed.current_task_state).read_text(encoding="utf-8").splitlines()
+            ]
+            events = [event.get("event") for event in trace]
+
+            normal = CAgent(
+                FakeModelClient(
+                    [
+                        '<tool name="write_file" path="normal.txt"><content>ok</content></tool>',
+                        "<final>done</final>",
+                    ]
+                ),
+                workspace,
+                store,
+                approval_policy="auto",
+            )
+            normal.ask("Perform a normal write.")
+            rows.append(
+                {
+                    "repetition": repetition,
+                    "recovery_detected": "recovery_checkpoint_detected" in events,
+                    "mutation_blocked": "recovery_mutation_blocked" in events,
+                    "inspection_completed": "recovery_inspection_completed" in events,
+                    "duplicate_mutation": (workspace_root / "sample.txt").read_text(encoding="utf-8") == "duplicated\n",
+                    "normal_checkpoint_leak": normal.recovery_store.path(normal.session["id"]).exists(),
+                    # 当前指标场景未注入“history 已保存但 clear 前崩溃”的安全假阳性。
+                    "false_positive_reinspection_count": 0,
+                }
+            )
+    count = len(rows)
+    summary = {
+        "recovery_detection_rate": _safe_ratio(sum(row["recovery_detected"] for row in rows), count),
+        "mutation_block_rate": _safe_ratio(sum(row["mutation_blocked"] for row in rows), count),
+        "inspection_completion_rate": _safe_ratio(sum(row["inspection_completed"] for row in rows), count),
+        "duplicate_mutation_rate": _safe_ratio(sum(row["duplicate_mutation"] for row in rows), count),
+        "normal_checkpoint_leak_rate": _safe_ratio(sum(row["normal_checkpoint_leak"] for row in rows), count),
+        "false_positive_reinspection_count": sum(row["false_positive_reinspection_count"] for row in rows),
+    }
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
         "artifact_type": "recovery-ablation-v2",
-        "captured_at": datetime.utcnow().isoformat() + "Z",
-        "task_count": len(RECOVERY_ABLATION_TASKS),
-        "variants": {
-            variant: {
-                "summary": _recovery_variant_summary(rows),
-                "rows": rows,
-            }
-            for variant, rows in variants.items()
-        },
+        "captured_at": datetime.now(timezone.utc).isoformat(),
+        "scenario_count": count,
+        "summary": summary,
+        "rows": rows,
     }
     return _write_json_artifact(artifact_path, artifact)
 
@@ -2342,7 +2088,7 @@ def write_benchmark_core_report(
     memory = json.loads(Path(memory_artifact_path).read_text(encoding="utf-8"))
     recovery = json.loads(Path(recovery_artifact_path).read_text(encoding="utf-8"))
 
-    enabled_recovery = recovery["variants"]["resume_enabled"]["summary"]
+    enabled_recovery = recovery["summary"]
     lines = [
         "# CAgent Benchmark Core Report",
         "",
@@ -2369,11 +2115,12 @@ def write_benchmark_core_report(
         f"- memory_on correct_rate：{memory['variants']['memory_on']['correct_rate']:.2%}",
         f"- memory_hit_rate：{memory['variants']['memory_on']['memory_hit_rate']:.2%}",
         "",
-        "## Recovery / Resume Ablation",
-        f"- resume_success_rate：{enabled_recovery['resume_success_rate']:.2%}",
-        f"- stale_reanchor_rate：{enabled_recovery['stale_reanchor_rate']:.2%}",
-        f"- workspace_drift_detection_rate：{enabled_recovery['workspace_drift_detection_rate']:.2%}",
-        f"- resume_false_accept_rate：{enabled_recovery['resume_false_accept_rate']:.2%}",
+        "## Recovery Checkpoint",
+        f"- recovery_detection_rate：{enabled_recovery['recovery_detection_rate']:.2%}",
+        f"- mutation_block_rate：{enabled_recovery['mutation_block_rate']:.2%}",
+        f"- inspection_completion_rate：{enabled_recovery['inspection_completion_rate']:.2%}",
+        f"- duplicate_mutation_rate：{enabled_recovery['duplicate_mutation_rate']:.2%}",
+        f"- normal_checkpoint_leak_rate：{enabled_recovery['normal_checkpoint_leak_rate']:.2%}",
         "",
         "## 可以安全写进简历的指标",
         "- avg_full_prompt_chars",
@@ -2383,14 +2130,15 @@ def write_benchmark_core_report(
         "- repeated_reads",
         "- avg_tool_steps",
         "- correct_rate",
-        "- resume_success_rate",
-        "- workspace_drift_detection_rate",
-        "- resume_false_accept_rate",
+        "- recovery_detection_rate",
+        "- mutation_block_rate",
+        "- duplicate_mutation_rate",
         "",
         "## 只适合放文档/面试展开的指标",
         "- current_request_preserved_rate",
         "- memory_hit_rate",
-        "- stale_reanchor_rate",
+        "- inspection_completion_rate",
+        "- normal_checkpoint_leak_rate",
         "- failure_category_counts",
         "",
         "## 口径边界",
