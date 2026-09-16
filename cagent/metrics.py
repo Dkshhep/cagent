@@ -9,7 +9,10 @@ from .context_manager import RECOVERY_NOTICE_SECTION, CURRENT_REQUEST_SECTION, C
 from .recovery import capture_file_state
 from .evaluator import run_fixed_benchmark
 from .models import AnthropicCompatibleModelClient, FakeModelClient, OpenAICompatibleModelClient
+from .memory_decider import MemoryDecider
+from .memory_store import MemoryStore
 from .runtime import CAgent, SessionStore
+from .storage import write_json_atomic
 from .workspace import WorkspaceContext
 
 METRICS_SCHEMA_VERSION = 2
@@ -31,9 +34,9 @@ PROMPT_CACHE_SIZE_GROUPS = {
     "long": 50_000,
 }
 PROMPT_CACHE_SECTION_ORDERS = {
-    "current": ("prefix", "history", "memory", "relevant_memory", CURRENT_REQUEST_SECTION),
-    "volatile_before_history": ("prefix", "memory", "relevant_memory", "history", CURRENT_REQUEST_SECTION),
-    "request_before_memory": ("prefix", "history", CURRENT_REQUEST_SECTION, "memory", "relevant_memory"),
+    "current": ("prefix", "history", "saved_memory", CURRENT_REQUEST_SECTION),
+    "volatile_before_history": ("prefix", "saved_memory", "history", CURRENT_REQUEST_SECTION),
+    "request_before_memory": ("prefix", "history", CURRENT_REQUEST_SECTION, "saved_memory"),
     "prefix_only": ("prefix", CURRENT_REQUEST_SECTION),
 }
 
@@ -49,6 +52,19 @@ def _safe_ratio(numerator, denominator):
     if not denominator:
         return 0.0
     return numerator / denominator
+
+
+def _seed_synthetic_card(agent, index, display_text, tags=("benchmark",)):
+    """只供合成评测使用，不从工具结果生成真实用户记忆。"""
+    return agent.memory_store.commit({
+        "op": "add", "target_card_id": "", "key": f"benchmark.preference_{index}",
+        "kind": "preference", "scope": "project", "tags": list(tags),
+        "current_value": str(display_text)[:160], "display_text": str(display_text)[:240],
+        "change_note": "", "source": {
+            "authorization_turn_id": "synthetic_benchmark", "content_turn_ids": ["synthetic_benchmark"],
+            "user_quote": "synthetic benchmark fixture",
+        },
+    })
 
 
 def _parse_iso8601(value):
@@ -191,7 +207,7 @@ def measure_feature_ablation_metrics(agent, user_message):
     variants = {
         "full": {},
         "no_context_reduction": {"context_reduction": False},
-        "no_memory": {"memory": False, "relevant_memory": False},
+        "no_memory": {"saved_memory": False},
     }
     results = {}
     for name, updates in variants.items():
@@ -199,9 +215,9 @@ def measure_feature_ablation_metrics(agent, user_message):
             prompt, metadata = agent._build_prompt_and_metadata(user_message)
         results[name] = {
             "prompt_chars": int(metadata.get("prompt_chars", 0)),
-            "memory_chars": int(metadata.get("sections", {}).get("memory", {}).get("rendered_chars", 0)),
+            "memory_chars": int(metadata.get("sections", {}).get("saved_memory", {}).get("rendered_chars", 0)),
             "history_chars": int(metadata.get("sections", {}).get("history", {}).get("rendered_chars", 0)),
-            "relevant_selected_count": int(metadata.get("relevant_memory", {}).get("selected_count", 0)),
+            "relevant_selected_count": len(metadata.get("selected_card_ids", [])),
             "budget_reduction_count": len(metadata.get("budget_reductions", [])),
             "current_request_preserved": prompt.endswith(f"Current user request:\n{user_message}"),
         }
@@ -221,11 +237,7 @@ def build_stress_agent_metrics():
             approval_policy="auto",
         )
         for index in range(12):
-            agent.memory.append_note(
-                f"stress-note-{index}-" + ("A" * 180),
-                tags=("recall",),
-                created_at=f"2026-04-08T10:{index:02d}:00+00:00",
-            )
+            _seed_synthetic_card(agent, index, f"stress-preference-{index}-" + ("A" * 150), tags=("recall",))
             agent.record(
                 {
                     "role": "user" if index % 2 == 0 else "assistant",
@@ -236,223 +248,13 @@ def build_stress_agent_metrics():
         return measure_feature_ablation_metrics(agent, "recall")
 
 
-class _MemoryExperimentModelClient(FakeModelClient):
-    def __init__(self, expected_fact, filename):
-        super().__init__([])
-        self.expected_fact = str(expected_fact).strip().lower()
-        self.filename = str(filename).strip()
-        self.phase = "bootstrap_tool"
-        self.followup_reads = 0
-
-    def complete(self, prompt, max_new_tokens, **kwargs):
-        del max_new_tokens, kwargs
-        self.prompts.append(prompt)
-        self.last_completion_metadata = {}
-        if self.phase == "bootstrap_tool":
-            self.phase = "bootstrap_final"
-            return f'<tool>{{"name":"read_file","args":{{"path":"{self.filename}","start":1,"end":20}}}}</tool>'
-        if self.phase == "bootstrap_final":
-            self.phase = "question"
-            return "<final>Done.</final>"
-        if self.phase == "question":
-            prompt_lower = prompt.lower()
-            memory_view = ""
-            if "memory:" in prompt_lower and "\n\nrelevant memory:" in prompt_lower:
-                memory_view = prompt_lower.split("memory:", 1)[1].split("\n\nrelevant memory:", 1)[0]
-            relevant_view = ""
-            if "relevant memory:" in prompt_lower and "\n\ntranscript:" in prompt_lower:
-                relevant_view = prompt_lower.split("relevant memory:", 1)[1].split("\n\ntranscript:", 1)[0]
-            if self.expected_fact in memory_view or self.expected_fact in relevant_view:
-                return f"<final>{self.expected_fact.capitalize()}.</final>"
-            self.phase = "question_after_read"
-            self.followup_reads += 1
-            return f'<tool>{{"name":"read_file","args":{{"path":"{self.filename}","start":1,"end":20}}}}</tool>'
-        if self.phase == "question_after_read":
-            self.phase = "done"
-            return f"<final>{self.expected_fact.capitalize()}.</final>"
-        return f"<final>{self.expected_fact.capitalize()}.</final>"
-
-
-def _build_memory_experiment_agent(workspace_root, expected_fact, filename):
-    workspace = WorkspaceContext.build(workspace_root)
-    store = SessionStore(workspace_root / ".cagent" / "sessions")
-    return CAgent(
-        model_client=_MemoryExperimentModelClient(expected_fact, filename),
-        workspace=workspace,
-        session_store=store,
-        approval_policy="auto",
-    )
-
-
-def _set_irrelevant_memory(agent):
-    state = agent.memory.to_dict()
-    state["episodic_notes"] = [
-        {
-            "text": "team mascot is blue",
-            "tags": ["unrelated"],
-            "source": "other.txt",
-            "created_at": "2026-04-08T10:00:00+00:00",
-            "note_index": 0,
-        }
-    ]
-    state["notes"] = ["team mascot is blue"]
-    state["file_summaries"] = {}
-    agent.memory.state = state
-    agent.session["memory"] = agent.memory.to_dict()
-
-
-def _run_memory_variant(mode):
-    with tempfile.TemporaryDirectory(prefix="cagent-memory-experiment-") as temp_dir:
-        workspace_root = Path(temp_dir)
-        (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
-        (workspace_root / "facts.txt").write_text("deploy key is red\n", encoding="utf-8")
-        agent = _build_memory_experiment_agent(workspace_root, "deploy key is red", "facts.txt")
-        assert agent.ask("Read facts.txt and remember the key fact.") == "Done."
-
-        if mode == "memory_off":
-            agent.feature_flags["memory"] = False
-            agent.feature_flags["relevant_memory"] = False
-        elif mode == "memory_irrelevant":
-            _set_irrelevant_memory(agent)
-
-        result = agent.ask("What color is the deploy key?")
-        task_state = agent.current_task_state
-        model_client = agent.model_client
-        return {
-            "correct": result.strip().lower() == "deploy key is red.",
-            "tool_steps": int(task_state.tool_steps),
-            "attempts": int(task_state.attempts),
-            "repeated_reads": int(getattr(model_client, "followup_reads", 0)),
-        }
-
-
 def run_memory_dependency_experiment(repetitions=3):
-    variants = {
-        "memory_on": [],
-        "memory_off": [],
-        "memory_irrelevant": [],
-    }
-    for _ in range(int(repetitions)):
-        for variant in variants:
-            variants[variant].append(_run_memory_variant(variant))
-
-    results = {}
-    for variant, rows in variants.items():
-        results[variant] = {
-            "repeated_reads": sum(row["repeated_reads"] for row in rows),
-            "avg_tool_steps": _safe_mean(row["tool_steps"] for row in rows),
-            "avg_attempts": _safe_mean(row["attempts"] for row in rows),
-            "correct_rate": _safe_ratio(sum(1 for row in rows if row["correct"]), len(rows)),
-        }
-    return results
-
-
-MEMORY_EXPERIMENT_TASKS = [
-    {"id": "fact_color", "category": "fact_lookup", "filename": "facts.txt", "fact": "deploy key is red"},
-    {"id": "fact_api", "category": "fact_lookup", "filename": "settings.txt", "fact": "api base path is /v1/internal"},
-    {"id": "fact_budget", "category": "fact_lookup", "filename": "limits.txt", "fact": "default step budget is 6"},
-    {"id": "fact_timeout", "category": "fact_lookup", "filename": "runtime.txt", "fact": "timeout ceiling is 120 seconds"},
-    {"id": "edit_intro", "category": "edit_dependency", "filename": "README.md", "fact": "first bullet is the locked intro line"},
-    {"id": "edit_token", "category": "edit_dependency", "filename": "sample.txt", "fact": "second token is placeholder"},
-    {"id": "edit_field", "category": "edit_dependency", "filename": "config.txt", "fact": "fixed field name is benchmark_schema"},
-    {"id": "edit_line", "category": "edit_dependency", "filename": "notes.txt", "fact": "locked marker is on line three"},
-    {"id": "history_file", "category": "history_reference", "filename": "history.txt", "fact": "deploy fact came from facts.txt"},
-    {"id": "history_line", "category": "history_reference", "filename": "history.txt", "fact": "benchmark note came from line two"},
-    {"id": "history_token", "category": "history_reference", "filename": "history.txt", "fact": "placeholder token was beta"},
-    {"id": "history_tool", "category": "history_reference", "filename": "history.txt", "fact": "inspection tool was read_file"},
-]
-
-
-def _write_memory_task_files(workspace_root, task):
-    filename = task["filename"]
-    payload = task["fact"]
-    (workspace_root / filename).write_text(payload + "\n", encoding="utf-8")
-
-
-def _bootstrap_prompt(task):
-    return f"Read {task['filename']} and remember the key fact."
-
-
-def _followup_prompt(task):
-    if task["category"] == "fact_lookup":
-        return f"What does {task['filename']} say?"
-    if task["category"] == "edit_dependency":
-        return f"Use the remembered constraint from {task['filename']} to continue without rereading."
-    return f"What was the conclusion we already established from {task['filename']}?"
-
-
-def _set_irrelevant_memory_for_task(agent):
-    state = agent.memory.to_dict()
-    state["episodic_notes"] = [
-        {
-            "text": "the team mascot is blue",
-            "tags": ["unrelated"],
-            "source": "other.txt",
-            "created_at": "2026-04-08T10:00:00+00:00",
-            "note_index": 0,
-        }
-    ]
-    state["notes"] = ["the team mascot is blue"]
-    state["file_summaries"] = {}
-    agent.memory.state = state
-    agent.session["memory"] = agent.memory.to_dict()
-
-
-def _run_memory_task_variant(task, variant):
-    with tempfile.TemporaryDirectory(prefix="cagent-memory-large-") as temp_dir:
-        workspace_root = Path(temp_dir)
-        (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
-        _write_memory_task_files(workspace_root, task)
-        agent = _build_memory_experiment_agent(workspace_root, task["fact"], task["filename"])
-        assert agent.ask(_bootstrap_prompt(task)) == "Done."
-        if variant == "memory_off":
-            agent.feature_flags["memory"] = False
-            agent.feature_flags["relevant_memory"] = False
-        elif variant == "memory_irrelevant":
-            _set_irrelevant_memory_for_task(agent)
-        result = agent.ask(_followup_prompt(task))
-        task_state = agent.current_task_state
-        return {
-            "correct": result.strip().lower() == f"{task['fact']}.",
-            "tool_steps": int(task_state.tool_steps),
-            "attempts": int(task_state.attempts),
-            "repeated_reads": int(getattr(agent.model_client, "followup_reads", 0)),
-        }
+    with tempfile.TemporaryDirectory(prefix="cagent-memory-card-contract-") as temp_dir:
+        return run_memory_ablation_v2(Path(temp_dir) / "memory-cards.json", repetitions=repetitions)
 
 
 def run_large_scale_memory_experiment(repetitions=5):
-    repetitions = int(repetitions)
-    variants = {
-        "memory_on": [],
-        "memory_off": [],
-        "memory_irrelevant": [],
-    }
-    for task in MEMORY_EXPERIMENT_TASKS:
-        for _ in range(repetitions):
-            for variant in variants:
-                row = _run_memory_task_variant(task, variant)
-                row["task_id"] = task["id"]
-                row["category"] = task["category"]
-                variants[variant].append(row)
-    category_counts = {}
-    for task in MEMORY_EXPERIMENT_TASKS:
-        category_counts[task["category"]] = category_counts.get(task["category"], 0) + 1
-    return {
-        "task_count": len(MEMORY_EXPERIMENT_TASKS),
-        "runs_per_variant": len(MEMORY_EXPERIMENT_TASKS) * repetitions,
-        "category_counts": category_counts,
-        "variants": {
-            variant: {
-                "repeated_reads": sum(row["repeated_reads"] for row in rows),
-                "avg_tool_steps": _safe_mean(row["tool_steps"] for row in rows),
-                "avg_attempts": _safe_mean(row["attempts"] for row in rows),
-                "correct_rate": _safe_ratio(sum(1 for row in rows if row["correct"]), len(rows)),
-                "memory_hit_rate": _safe_ratio(sum(1 for row in rows if row["repeated_reads"] == 0), len(rows)),
-            }
-            for variant, rows in variants.items()
-        },
-        "rows": variants,
-    }
+    return run_memory_dependency_experiment(repetitions=repetitions)
 
 
 def run_context_stress_matrix(repetitions=5):
@@ -479,11 +281,7 @@ def run_context_stress_matrix(repetitions=5):
                             approval_policy="auto",
                         )
                         for index in range(note_count):
-                            agent.memory.append_note(
-                                f"matrix-note-{index}-" + ("A" * 180),
-                                tags=("recall",),
-                                created_at=f"2026-04-08T10:{index:02d}:00+00:00",
-                            )
+                            _seed_synthetic_card(agent, index, f"matrix-preference-{index}-" + ("A" * 150), tags=("recall",))
                         for index in range(history_count):
                             agent.record(
                                 {
@@ -567,18 +365,14 @@ def _context_compression_v3_agent(workspace_root, history_count, tool_density):
         context_window_tokens=24_000,
         output_reserve_tokens=2_000,
         safety_margin_tokens=2_000,
-        section_budgets={"prefix": 800, "memory": 500, "relevant_memory": 500, "history": 12_000},
-        section_floors={"prefix": 200, "memory": 120, "relevant_memory": 120, "history": 3_000},
+        section_budgets={"prefix": 800, "saved_memory": 500, "history": 12_000},
+        section_floors={"prefix": 200, "saved_memory": 0, "history": 3_000},
         section_max={"current_request": 2_000},
         current_request_soft_max_tokens=1_600,
         min_history_tokens=80,
     )
     for index in range(4):
-        agent.memory.append_note(
-            f"context-compression-v3-note-{index}: benchmark fact {index}",
-            tags=("compression", "benchmark"),
-            created_at=f"2026-06-23T09:{index:02d}:00+00:00",
-        )
+        _seed_synthetic_card(agent, index, f"context-compression-v3-preference-{index}", tags=("compression", "benchmark"))
     _seed_context_compression_v3_history(agent, history_count, tool_density)
     return agent
 
@@ -862,24 +656,13 @@ def _prompt_cache_agent(workspace_root):
 
 
 def _set_prompt_cache_memory(agent, memory_epoch, relevant_epoch):
-    memory_text = "Memory:\n" + "\n".join(
-        [
-            f"- working fact epoch={memory_epoch}",
-            f"- cached file summary epoch={memory_epoch}: " + ("M" * 160),
-        ]
-    )
-    relevant_notes = [
+    agent._prompt_cache_cards = [
         {
-            "text": f"relevant note epoch={relevant_epoch} item={index} " + ("R" * 120),
-            "tags": ["cache"],
-            "source": f"note-{index}",
-            "kind": "episodic",
-            "created_at": f"2026-04-20T10:0{index}:00+00:00",
+            "id": f"synthetic-{index}", "scope": "project", "key": f"benchmark.cache_{index}",
+            "display_text": f"saved preference epoch={memory_epoch} selection={relevant_epoch} item={index} " + ("M" * 120),
         }
         for index in range(3)
     ]
-    agent.memory.render_memory_text = lambda: memory_text
-    agent.memory.retrieval_candidates = lambda query, limit=3: relevant_notes[:limit]
 
 
 def _seed_prompt_cache_history(agent, target_prompt_chars=3_000, count=8, label="stable"):
@@ -896,15 +679,15 @@ def _seed_prompt_cache_history(agent, target_prompt_chars=3_000, count=8, label=
 
 
 def _render_prompt_cache_sections(agent, user_message):
-    selected_notes = agent.memory.retrieval_candidates(user_message, limit=3)
+    selected_cards = agent._prompt_cache_cards
     section_texts = {
         "prefix": str(agent.prefix),
         RECOVERY_NOTICE_SECTION: "",
-        "memory": str(agent.memory_text()),
+        "saved_memory": "",
         "history": "",
         CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
     }
-    rendered = agent.context_manager._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
+    rendered = agent.context_manager._render_sections_without_reduction(section_texts, selected_cards=selected_cards)
     return {section: rendered[section].rendered for section in PROMPT_CACHE_SECTION_ORDERS["current"]}
 
 
@@ -940,7 +723,7 @@ def _changed_cache_sections(previous, current):
     changed = []
     previous_sections = previous.get("sections", {})
     current_sections = current.get("sections", {})
-    for section in ("prefix", "history", "memory", "relevant_memory"):
+    for section in ("prefix", "history", "saved_memory"):
         if previous_sections.get(section) != current_sections.get(section):
             changed.append(section)
     return changed
@@ -1463,37 +1246,6 @@ def run_provider_experiments(benchmark_path, workspace_root, artifact_root, max_
     return {"providers": providers}
 
 
-def _followup_trace_metrics(agent):
-    trace_path = agent.run_store.trace_path(agent.current_task_state)
-    events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines() if line.strip()]
-    repeated_reads = sum(1 for event in events if event.get("event") == "tool_executed" and event.get("name") == "read_file")
-    return repeated_reads
-
-
-def _inject_memory_noise(agent, rounds=8):
-    for index in range(int(rounds)):
-        agent.record(
-            {
-                "role": "user" if index % 2 == 0 else "assistant",
-                "content": f"filler-turn-{index}-" + ("context-noise-" * 40),
-                "created_at": f"2026-04-09T12:{index:02d}:00+00:00",
-            }
-        )
-
-
-def _truncate_read_history(agent):
-    updated = []
-    for item in agent.session["history"]:
-        if item.get("role") == "tool" and item.get("name") == "read_file":
-            replacement = dict(item)
-            replacement["content"] = f"# {item.get('args', {}).get('path', 'file')}\n(truncated from transcript)"
-            updated.append(replacement)
-        else:
-            updated.append(item)
-    agent.session["history"] = updated
-    agent.session_path = agent.session_store.save(agent.session)
-
-
 def _build_real_agent(workspace_root, provider, approval_policy="auto", read_only=False):
     workspace = WorkspaceContext.build(workspace_root)
     store = SessionStore(workspace_root / ".cagent" / "sessions")
@@ -1501,74 +1253,99 @@ def _build_real_agent(workspace_root, provider, approval_policy="auto", read_onl
         model_client=_make_provider_client(provider),
         workspace=workspace,
         session_store=store,
+        memory_store=MemoryStore(workspace_root, global_root=workspace_root / "global-memory"),
         approval_policy=approval_policy,
         read_only=read_only,
     )
 
 
 def run_real_memory_experiment(provider="gpt", repetitions=1):
-    repetitions = int(repetitions)
-    provider = str(provider)
-    variants = {"memory_on": [], "memory_off": [], "memory_irrelevant": []}
-    category_counts = {}
-    for task in MEMORY_EXPERIMENT_TASKS:
-        category_counts[task["category"]] = category_counts.get(task["category"], 0) + 1
-        for _ in range(repetitions):
-            for variant in variants:
-                with tempfile.TemporaryDirectory(prefix="cagent-real-memory-") as temp_dir:
-                    workspace_root = Path(temp_dir)
-                    (workspace_root / "README.md").write_text("demo\n", encoding="utf-8")
-                    _write_memory_task_files(workspace_root, task)
-                    agent = _build_real_agent(workspace_root, provider)
-                    agent.ask(f"Read {task['filename']} and remember the exact line. After you know it, reply with Done only.")
-                    if variant == "memory_off":
-                        agent.feature_flags["memory"] = False
-                        agent.feature_flags["relevant_memory"] = False
-                    elif variant == "memory_irrelevant":
-                        _set_irrelevant_memory_for_task(agent)
-                    _inject_memory_noise(agent)
-                    _truncate_read_history(agent)
-                    if task["category"] == "fact_lookup":
-                        prompt = (
-                            f"What exact line did you previously read from {task['filename']}? "
-                            "Reply with the exact line only. If you are not certain, verify with tools instead of guessing."
-                        )
-                    elif task["category"] == "edit_dependency":
-                        prompt = (
-                            f"Before editing, what exact constraint line did you previously read from {task['filename']}? "
-                            "Reply with the exact line only. If you are not certain, verify with tools instead of guessing."
-                        )
-                    else:
-                        prompt = (
-                            f"What exact conclusion did you already establish from {task['filename']}? "
-                            "Reply with the exact line only. If you are not certain, verify with tools instead of guessing."
-                        )
-                    answer = agent.ask(prompt)
-                    variants[variant].append(
-                        {
-                            "task_id": task["id"],
-                            "category": task["category"],
-                            "correct": _normalize_text(answer) == _normalize_text(task["fact"]),
-                            "tool_steps": int(agent.current_task_state.tool_steps),
-                            "attempts": int(agent.current_task_state.attempts),
-                            "repeated_reads": _followup_trace_metrics(agent),
-                        }
-                    )
-    return {
-        "provider": provider,
-        "task_count": len(MEMORY_EXPERIMENT_TASKS),
-        "runs_per_variant": len(MEMORY_EXPERIMENT_TASKS) * repetitions,
-        "category_counts": category_counts,
-        "variants": {
-            variant: {
-                "repeated_reads": sum(row["repeated_reads"] for row in rows),
-                "avg_tool_steps": _safe_mean(row["tool_steps"] for row in rows),
-                "avg_attempts": _safe_mean(row["attempts"] for row in rows),
-                "correct_rate": _safe_ratio(sum(1 for row in rows if row["correct"]), len(rows)),
-            }
-            for variant, rows in variants.items()
+    """真实模型对照：独立 follow-up 工作区只给 on 组复制已审定卡片。"""
+    import re
+
+    def review_token_sum(reviews, field):
+        completions = [review.get("completion") or {} for review in reviews]
+        if not completions or any(not completion.get("usage_keys") or completion.get(field) is None for completion in completions):
+            return None
+        return sum(int(completion[field]) for completion in completions)
+
+    profile = _provider_profile(provider)
+    if profile["status"] != "ready":
+        return {"provider": provider, "status": "unavailable", "reason": profile.get("reason", "provider_unavailable"), "rows": []}
+    tasks = [
+        {
+            "id": "comment_language",
+            "setup": ["记住：这个项目以后 Python 代码注释使用西班牙语。"],
+            "followup": "继续：只给一行 Python 注释，描述求和函数；遵守项目约定。",
+            "expected": lambda answer: "#" in answer and bool(re.search(r"(?i)\b(suma|sumar|calcula|calcular)\b", answer)),
         },
-        "rows": variants,
+        {
+            "id": "package_manager",
+            "setup": ["记住：这个项目以后默认用 pdm 管理 Python 依赖。"],
+            "followup": "继续：只给一条安装 pytest 的命令，沿用项目约定。",
+            "expected": lambda answer: "pdm " in answer.lower(),
+        },
+        {
+            "id": "explicit_update",
+            "setup": ["记住：这个项目以后使用 SQLite。", "记住：这个项目以后改用 MariaDB，不用 SQLite 了。"],
+            "followup": "继续：这个项目当前使用哪个数据库？只回答名称。",
+            "expected": lambda answer: "mariadb" in answer.lower() and "sqlite" not in answer.lower(),
+        },
+    ]
+    rows = []
+    for task in tasks:
+        for repetition in range(int(repetitions)):
+            with tempfile.TemporaryDirectory(prefix="cagent-memory-setup-") as setup_dir:
+                setup_root = Path(setup_dir)
+                (setup_root / "README.md").write_text("demo\n", encoding="utf-8")
+                setup_agent = _build_real_agent(setup_root, provider)
+                setup_agent.memory_decider = MemoryDecider(setup_agent.model_client)
+                setup_reviews = []
+                for message in task["setup"]:
+                    setup_agent.ask(message)
+                    setup_reviews.append(dict(setup_agent.last_memory_review))
+                saved_card_count = len(setup_agent.memory_store.active("project"))
+                saved_document = setup_agent.memory_store.read("project")
+                for variant in ("memory_on", "memory_off"):
+                    with tempfile.TemporaryDirectory(prefix="cagent-memory-followup-") as followup_dir:
+                        followup_root = Path(followup_dir)
+                        (followup_root / "README.md").write_text("demo\n", encoding="utf-8")
+                        # 新工作区没有 setup 的 history/trace；只给 on 组移入已审定卡片。
+                        agent = _build_real_agent(followup_root, provider)
+                        if variant == "memory_on":
+                            write_json_atomic(agent.memory_store.project_path, saved_document)
+                        else:
+                            agent.feature_flags["saved_memory"] = False
+                        answer = agent.ask(task["followup"])
+                        rows.append({
+                            "task_id": task["id"], "repetition": repetition, "variant": variant,
+                            "correct": bool(task["expected"](answer)),
+                            "saved_card_count": saved_card_count,
+                            "followup_card_count": len(agent.memory_store.active("project")),
+                            "setup_review_statuses": [review["status"] for review in setup_reviews],
+                            "setup_review_failure_reasons": [review.get("failure_reason", "") for review in setup_reviews],
+                            "review_duration_ms": sum(int(review.get("duration_ms", 0)) for review in setup_reviews),
+                            "review_input_tokens": review_token_sum(setup_reviews, "input_tokens"),
+                            "review_output_tokens": review_token_sum(setup_reviews, "output_tokens"),
+                            "selected_card_count": len(agent.last_prompt_metadata.get("selected_card_ids", [])),
+                            "tool_steps": int(agent.current_task_state.tool_steps),
+                            "answer_preview": agent.redact_text(answer)[:200],
+                        })
+    variants = {}
+    for variant in ("memory_on", "memory_off"):
+        subset = [row for row in rows if row["variant"] == variant]
+        variants[variant] = {
+            "preference_follow_rate": _safe_ratio(sum(row["correct"] for row in subset), len(subset)),
+            "avg_review_duration_ms": _safe_mean(row["review_duration_ms"] for row in subset),
+            "avg_review_input_tokens": _safe_mean(row["review_input_tokens"] for row in subset if row["review_input_tokens"] is not None) if any(row["review_input_tokens"] is not None for row in subset) else None,
+            "avg_review_output_tokens": _safe_mean(row["review_output_tokens"] for row in subset if row["review_output_tokens"] is not None) if any(row["review_output_tokens"] is not None for row in subset) else None,
+            "avg_selected_card_count": _safe_mean(row["selected_card_count"] for row in subset),
+            "setup_failure_rate": _safe_ratio(sum(any(status == "failed" for status in row["setup_review_statuses"]) for row in subset), len(subset)),
+        }
+    return {
+        "provider": provider, "status": "completed", "experiment_type": "real_memory_card_ablation",
+        "task_count": len(tasks), "runs_per_variant": len(tasks) * int(repetitions),
+        "variants": variants, "rows": rows,
     }
 
 
@@ -1595,7 +1372,7 @@ def run_real_context_experiment(provider="gpt", repetitions=1):
                             agent = _build_real_agent(workspace_root, provider)
                             for index in range(note_count):
                                 note_text = f"target token is {token}" if index == 0 else f"decoy token is DECOY-{index}"
-                                agent.memory.append_note(note_text, tags=("token",), created_at=f"2026-04-09T10:{index:02d}:00+00:00")
+                                _seed_synthetic_card(agent, index, note_text, tags=("token",))
                             for index in range(history_count):
                                 agent.record(
                                     {
@@ -1605,7 +1382,7 @@ def run_real_context_experiment(provider="gpt", repetitions=1):
                                     }
                                 )
                             with _temporary_feature_flags(agent, updates):
-                                answer = agent.ask(f"What is the target token remembered in the notes? {request_text}")
+                                answer = agent.ask(f"What is the target token in the saved benchmark preference? {request_text}")
                             per_run.append(
                                 {
                                     "variant": variant_name,
@@ -1753,7 +1530,7 @@ def collect_resume_metrics(
     real_provider = str(real_provider)
     if experiment_mode == "real":
         memory_large = run_real_memory_experiment(provider=real_provider, repetitions=large_memory_repetitions)
-        memory = {name: dict(values) for name, values in memory_large["variants"].items()}
+        memory = memory_large
         context = run_real_context_experiment(provider=real_provider, repetitions=context_repetitions)
         security = run_real_security_experiment_suite(provider=real_provider, repetitions=security_repetitions)
         stress = {
@@ -1762,8 +1539,9 @@ def collect_resume_metrics(
         }
     else:
         stress = build_stress_agent_metrics()
-        memory = run_memory_dependency_experiment(repetitions=memory_repetitions)
-        memory_large = run_large_scale_memory_experiment(repetitions=large_memory_repetitions)
+        with tempfile.TemporaryDirectory(prefix="cagent-memory-card-aggregation-") as temp_dir:
+            memory = run_memory_ablation_v2(Path(temp_dir) / "memory-small.json", repetitions=memory_repetitions)
+            memory_large = run_memory_ablation_v2(Path(temp_dir) / "memory-large.json", repetitions=large_memory_repetitions)
         context = run_context_stress_matrix(repetitions=context_repetitions)
         security = run_security_experiment_suite(repetitions=security_repetitions)
     provider_payload = {"providers": []}
@@ -1795,8 +1573,11 @@ def collect_resume_metrics(
                 if experiment_mode == "real"
                 else f"In a synthetic long-context stress scenario, context reduction shrank prompt size from {stress['no_context_reduction']['prompt_chars']} to {stress['full']['prompt_chars']} chars."
             ),
-            f"In the memory dependency experiment, repeated follow-up reads dropped from {memory['memory_off']['repeated_reads']} to {memory['memory_on']['repeated_reads']}.",
-            f"In the large-scale memory experiment, repeated reads dropped from {memory_large['variants']['memory_off']['repeated_reads']} to {memory_large['variants']['memory_on']['repeated_reads']} across {memory_large['task_count']} tasks.",
+            (
+                f"Real-model saved-memory preference follow rate: on={memory_large['variants']['memory_on']['preference_follow_rate']:.2%}, off={memory_large['variants']['memory_off']['preference_follow_rate']:.2%}."
+                if experiment_mode == "real" and memory_large.get("status") == "completed"
+                else f"Deterministic memory-card duplicate rate: {memory_large.get('summary', {}).get('duplicate_card_rate', 0):.2%}; this is a contract test, not a real-model gain."
+            ),
         ],
     }
 
@@ -1805,7 +1586,6 @@ def render_resume_metrics_markdown(metrics):
     benchmark = metrics["benchmark"]
     runs = metrics["runs"]
     stress = metrics["stress_ablation"]
-    memory = metrics["memory_experiment"]
     memory_large = metrics["memory_large_experiment"]
     context = metrics["context_experiment"]
     security = metrics["security_experiment"]
@@ -1828,8 +1608,12 @@ def render_resume_metrics_markdown(metrics):
             if metrics.get("experiment_mode") == "real"
             else f"- Synthetic prompt chars (full vs no context reduction): {stress['full']['prompt_chars']} / {stress['no_context_reduction']['prompt_chars']}"
         ),
-        f"- Memory repeated reads (on vs off): {memory['memory_on']['repeated_reads']} / {memory['memory_off']['repeated_reads']}",
-        f"- Large-scale memory tasks: {memory_large['task_count']}",
+        (
+            f"- Real saved-memory preference follow rate (on/off): {memory_large['variants']['memory_on']['preference_follow_rate']:.2%} / {memory_large['variants']['memory_off']['preference_follow_rate']:.2%}"
+            if metrics.get("experiment_mode") == "real" and memory_large.get("status") == "completed"
+            else f"- Synthetic memory-card duplicate rate: {memory_large.get('summary', {}).get('duplicate_card_rate', 0):.2%}"
+        ),
+        f"- Memory card scenarios: {memory_large.get('scenario_count', memory_large.get('task_count', 0))}",
         f"- Context matrix configs: {context['config_count']}",
         f"- Security scenarios: {security['scenario_count']}",
         "",
@@ -1852,7 +1636,6 @@ def render_resume_metrics_markdown(metrics):
 
 def render_large_scale_experiment_report(metrics):
     benchmark = metrics["benchmark"]
-    memory_small = metrics["memory_experiment"]
     memory_large = metrics["memory_large_experiment"]
     context = metrics["context_experiment"]
     security = metrics["security_experiment"]
@@ -1874,7 +1657,7 @@ def render_large_scale_experiment_report(metrics):
             else f"- Experiment mode: {metrics.get('experiment_mode', 'synthetic')}"
         ),
         f"- Fixed benchmark tasks: {benchmark['task_count']}",
-        f"- Large-scale memory tasks: {memory_large['task_count']}",
+        f"- Memory card scenarios: {memory_large.get('scenario_count', memory_large.get('task_count', 0))}",
         f"- Context stress configurations: {context['config_count']}",
         f"- Security scenarios: {security['scenario_count']}",
         "",
@@ -1887,10 +1670,13 @@ def render_large_scale_experiment_report(metrics):
         f"- Average prompt compression ratio across context matrix: {context['summary']['avg_prompt_compression_ratio']:.2%}",
         f"- Max prompt compression ratio across context matrix: {context['summary']['max_prompt_compression_ratio']:.2%}",
         "",
-        "## Memory Experiments",
-        f"- Small memory experiment repeated reads: {memory_small['memory_on']['repeated_reads']} vs {memory_small['memory_off']['repeated_reads']}",
-        f"- Large memory experiment repeated reads: {memory_large['variants']['memory_on']['repeated_reads']} vs {memory_large['variants']['memory_off']['repeated_reads']}",
-        f"- Large memory experiment avg tool steps: {memory_large['variants']['memory_on']['avg_tool_steps']:.2f} vs {memory_large['variants']['memory_off']['avg_tool_steps']:.2f}",
+        "## Memory Card Experiments",
+        (
+            f"- Real preference-follow rate, memory on/off: {memory_large['variants']['memory_on']['preference_follow_rate']:.2%} vs {memory_large['variants']['memory_off']['preference_follow_rate']:.2%}"
+            if metrics.get("experiment_mode") == "real" and memory_large.get("status") == "completed"
+            else f"- Deterministic duplicate-card rate: {memory_large.get('summary', {}).get('duplicate_card_rate', 0):.2%}"
+        ),
+        "- Synthetic card-contract metrics do not establish a real-model improvement.",
         "",
         "## Security Experiments",
         f"- Security event counts: {json.dumps(security['security_event_counts'], sort_keys=True)}",
@@ -1913,7 +1699,7 @@ def render_large_scale_experiment_report(metrics):
             "",
             "## Resume-Safe Claims",
             f"- Long-context stress scenario: prompt length reduced from {metrics['stress_ablation']['no_context_reduction']['prompt_chars']} to {metrics['stress_ablation']['full']['prompt_chars']}.",
-            f"- Large-scale memory experiment: repeated reads reduced from {memory_large['variants']['memory_off']['repeated_reads']} to {memory_large['variants']['memory_on']['repeated_reads']}.",
+            f"- Memory-card evaluation mode: {'real model' if metrics.get('experiment_mode') == 'real' else 'deterministic contract'}.",
             f"- Platform facts: {benchmark['task_count']} benchmark tasks, {metrics['facts']['tool_count']} tool types, {metrics['facts']['run_artifact_count']} run artifacts.",
             "",
         ]
@@ -1973,16 +1759,87 @@ def run_prompt_cache_layout_experiment(
 
 
 def run_memory_ablation_v2(artifact_path=DEFAULT_MEMORY_ABLATION_V2_PATH, repetitions=5):
-    payload = run_large_scale_memory_experiment(repetitions=repetitions)
+    """新卡片合同评测；Fake decider 不代表真实模型的偏好遵循率。"""
+    rows = []
+
+    class ContractDecider:
+        last_metadata = {"duration_ms": 0, "completion": {}}
+
+        def __init__(self):
+            self.mode = "add"
+            self.target = ""
+
+        def review(self, user_turn, **kwargs):
+            value = "英文" if self.mode == "update" else "中文"
+            if self.mode == "secret":
+                value = "sk-benchmark-secret"
+            proposal = {
+                "op": self.mode if self.mode != "secret" else "add",
+                "target_card_id": self.target if self.mode in {"update", "forget"} else "",
+                "key": "coding.comment_language", "kind": "preference", "scope": "project",
+                "tags": ["coding", "comments"], "current_value": value,
+                "display_text": f"当前项目注释使用{value}。", "change_note": "用户明确更新。" if self.mode == "update" else "",
+                "authorization_turn_id": user_turn["turn_id"],
+                "content_turn_ids": [user_turn["turn_id"]], "user_quote": user_turn["content"],
+            }
+            return {"decision": "change", "proposals": [proposal]}
+
+    for repetition in range(int(repetitions)):
+        with tempfile.TemporaryDirectory(prefix="cagent-memory-card-metrics-") as temp_dir:
+            root = Path(temp_dir)
+            (root / "README.md").write_text("demo\n", encoding="utf-8")
+            agent = CAgent(
+                FakeModelClient(["<final>Done.</final>"] * 5), WorkspaceContext.build(root),
+                SessionStore(root / ".cagent" / "sessions"),
+                memory_store=MemoryStore(root, global_root=root / "global-memory"), approval_policy="auto",
+            )
+            decider = ContractDecider()
+            agent.memory_decider = decider
+            agent.ask("记住：这个项目以后注释用中文")
+            first = agent.memory_store.active("project")[0]
+            agent.ask("记住：这个项目以后注释还是用中文")
+            duplicate_count = len(agent.memory_store.active("project")) - 1
+            decider.mode = "update"
+            decider.target = first["id"]
+            agent.ask("记住：这个项目以后改用英文注释，不用中文")
+            prompt_on, metadata_on = agent.context_manager.build("继续写注释")
+            agent.feature_flags["saved_memory"] = False
+            prompt_off, metadata_off = agent.context_manager.build("继续写注释")
+            agent.feature_flags["saved_memory"] = True
+            saved_section = prompt_on.split("Saved user preferences", 1)[1].split("Current user request", 1)[0]
+            agent.ask("这次先用中文注释")
+            temporary_saved = len(agent.memory_store.active("project")) != 1
+            decider.mode = "secret"
+            agent.ask("记住：这个项目以后注释用中文")
+            rows.append({
+                "repetition": repetition,
+                "duplicate_card_count": duplicate_count,
+                "old_value_leaked": "中文" in saved_section,
+                "temporary_saved": temporary_saved,
+                "secret_rejected": agent.last_memory_review["failure_reason"] == "secret_shaped_content",
+                "memory_on_selected": bool(metadata_on["selected_card_ids"]),
+                "memory_off_selected": bool(metadata_off["selected_card_ids"]),
+                "memory_on_prompt_chars": len(prompt_on),
+                "memory_off_prompt_chars": len(prompt_off),
+            })
+    count = len(rows)
     artifact = {
         "schema_version": METRICS_SCHEMA_VERSION,
-        "artifact_type": "memory-ablation-v2",
+        "artifact_type": "memory-card-ablation-v1",
         "captured_at": datetime.utcnow().isoformat() + "Z",
-        "task_count": payload["task_count"],
-        "runs_per_variant": payload["runs_per_variant"],
-        "category_counts": payload["category_counts"],
-        "variants": payload["variants"],
-        "rows": payload["rows"],
+        "mode": "deterministic_contract",
+        "real_model_calls": False,
+        "scenario_count": count,
+        "summary": {
+            "duplicate_card_rate": _safe_ratio(sum(row["duplicate_card_count"] > 0 for row in rows), count),
+            "old_value_leak_rate": _safe_ratio(sum(row["old_value_leaked"] for row in rows), count),
+            "temporary_save_rate": _safe_ratio(sum(row["temporary_saved"] for row in rows), count),
+            "secret_rejection_rate": _safe_ratio(sum(row["secret_rejected"] for row in rows), count),
+            "memory_on_selection_rate": _safe_ratio(sum(row["memory_on_selected"] for row in rows), count),
+            "memory_off_selection_rate": _safe_ratio(sum(row["memory_off_selected"] for row in rows), count),
+            "avg_prompt_overhead_chars": _safe_mean(row["memory_on_prompt_chars"] - row["memory_off_prompt_chars"] for row in rows),
+        },
+        "rows": rows,
     }
     return _write_json_artifact(artifact_path, artifact)
 
@@ -2092,7 +1949,7 @@ def write_benchmark_core_report(
     lines = [
         "# CAgent Benchmark Core Report",
         "",
-        "这轮 benchmark 只收缩到 Harness regression、context ablation、working memory ablation 和 recovery ablation 四层，不把 provider、run aggregation 或 durable memory 的别的结论揉进来。",
+        "这轮 benchmark 只收缩到 Harness regression、context ablation、记忆卡片合同评测和 recovery ablation 四层。记忆卡片场景使用确定性 fake decider，不证明真实模型的偏好遵循率。",
         "",
         "## Harness Regression",
         f"- 固定 regression 任务数：{harness['summary']['total_tasks']}",
@@ -2108,12 +1965,13 @@ def write_benchmark_core_report(
         f"- max_prompt_compression_ratio：{context['summary']['max_prompt_compression_ratio']:.2%}",
         f"- current_request_preserved_rate：{context['summary']['current_request_preserved_rate']:.2%}",
         "",
-        "## Working Memory Ablation",
-        f"- memory_on repeated_reads：{memory['variants']['memory_on']['repeated_reads']}",
-        f"- memory_off repeated_reads：{memory['variants']['memory_off']['repeated_reads']}",
-        f"- memory_on avg_tool_steps：{memory['variants']['memory_on']['avg_tool_steps']:.2f}",
-        f"- memory_on correct_rate：{memory['variants']['memory_on']['correct_rate']:.2%}",
-        f"- memory_hit_rate：{memory['variants']['memory_on']['memory_hit_rate']:.2%}",
+        "## Saved Memory Card Contract",
+        f"- duplicate_card_rate：{memory['summary']['duplicate_card_rate']:.2%}",
+        f"- old_value_leak_rate：{memory['summary']['old_value_leak_rate']:.2%}",
+        f"- temporary_save_rate：{memory['summary']['temporary_save_rate']:.2%}",
+        f"- secret_rejection_rate：{memory['summary']['secret_rejection_rate']:.2%}",
+        f"- memory_on_selection_rate：{memory['summary']['memory_on_selection_rate']:.2%}",
+        f"- memory_off_selection_rate：{memory['summary']['memory_off_selection_rate']:.2%}",
         "",
         "## Recovery Checkpoint",
         f"- recovery_detection_rate：{enabled_recovery['recovery_detection_rate']:.2%}",
@@ -2127,23 +1985,23 @@ def write_benchmark_core_report(
         "- avg_raw_prompt_chars",
         "- avg_prompt_compression_ratio",
         "- max_prompt_compression_ratio",
-        "- repeated_reads",
-        "- avg_tool_steps",
-        "- correct_rate",
+        "- duplicate_card_rate",
+        "- old_value_leak_rate",
+        "- temporary_save_rate",
         "- recovery_detection_rate",
         "- mutation_block_rate",
         "- duplicate_mutation_rate",
         "",
         "## 只适合放文档/面试展开的指标",
         "- current_request_preserved_rate",
-        "- memory_hit_rate",
+        "- memory_on_selection_rate (deterministic contract only)",
         "- inspection_completion_rate",
         "- normal_checkpoint_leak_rate",
         "- failure_category_counts",
         "",
         "## 口径边界",
         "- Harness regression 只证明 runtime 合同稳定，不证明 provider 上限。",
-        "- Context、memory、recovery 这三层只证明模块收益，不和 provider benchmark 混写。",
+        "- Context、memory、recovery 这三层不和 provider benchmark 混写；真实记忆收益仍需独立模型评测。",
     ]
     report_text = "\n".join(lines) + "\n"
     report_path = Path(report_path)

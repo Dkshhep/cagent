@@ -1,6 +1,6 @@
 """Prompt 组装与上下文预算控制。
 
-这个模块负责决定：每一轮到底把多少 prefix、memory、相关笔记、历史
+这个模块负责决定：每一轮到底把多少 prefix、保存的用户偏好、历史
 以及当前用户请求送进模型。
 """
 
@@ -21,13 +21,11 @@ DEFAULT_COMPRESSION_TARGET_RATIO = 0.30
 DEFAULT_TOTAL_BUDGET = DEFAULT_INPUT_HARD_BUDGET_TOKENS
 DEFAULT_SECTION_TARGETS = {
     "prefix": 8_000,
-    "memory": 4_000,
-    "relevant_memory": 4_000,
+    "saved_memory": 600,
 }
 DEFAULT_SECTION_MAX = {
     "prefix": 16_000,
-    "memory": 4_000,
-    "relevant_memory": 4_000,
+    "saved_memory": 800,
     "current_request": 2400,
 }
 DEFAULT_CURRENT_REQUEST_SOFT_MAX_TOKENS = 1600
@@ -38,19 +36,16 @@ DEFAULT_SECTION_BUDGETS = {
 }
 DEFAULT_SECTION_FLOORS = {
     "prefix": 2_000,
-    "memory": 1_000,
-    "relevant_memory": 500,
+    "saved_memory": 0,
     "history": DEFAULT_MIN_HISTORY_TOKENS,
 }
 # 当 prompt 超预算时，会优先压缩这些 section。history 是主弹性池。
-DEFAULT_REDUCTION_ORDER = ("history", "relevant_memory", "memory", "prefix")
+DEFAULT_REDUCTION_ORDER = ("history", "saved_memory", "prefix")
 # 顺序刻意设计：稳定的 prefix + 大块 history 放前面，让缓存切点落在 history 之后；
-# 易变的短期记忆（memory/file_summary 写操作时变、relevant_memory 每轮按 query 变）
-# 全部挪到 history 之后、current_request 之前，避免它们击穿 history 的前缀缓存。
+# 易变的保存卡片放在 history 之后，避免它击穿 history 的前缀缓存。
 RECOVERY_NOTICE_SECTION = "recovery_notice"
-SECTION_ORDER = ("prefix", "history", "memory", "relevant_memory", RECOVERY_NOTICE_SECTION, "current_request")
+SECTION_ORDER = ("prefix", "history", "saved_memory", RECOVERY_NOTICE_SECTION, "current_request")
 CURRENT_REQUEST_SECTION = "current_request"
-RELEVANT_MEMORY_LIMIT = 3
 TOKEN_SAFETY_FACTOR = 1.15
 HISTORY_HEAD_KEEP = 3
 DISTILLATION_HISTORY_THRESHOLD = 30
@@ -241,8 +236,8 @@ class ContextManager:
 
         为什么存在：
         仅靠用户这一轮输入，模型并不知道当前仓库状态、会话里已经读过什么、
-        哪些旧信息还值得继续参考。这个函数负责把“稳定基线 + 工作记忆 +
-        相关笔记 + 历史 + 当前请求”拼成真正发给模型的 prompt。
+        哪些旧信息还值得继续参考。这个函数负责把“稳定基线 + 历史 +
+        已保存的用户偏好 + 当前请求”拼成真正发给模型的 prompt。
 
         输入 / 输出：
         - 输入：`user_message`，也就是用户当前这一轮的新请求。
@@ -254,22 +249,19 @@ class ContextManager:
 
         在 agent 链路里的位置：
         它位于 `CAgent.ask()` 的每轮模型调用之前，是“真正发请求给模型”
-        的最后一道组装工序。`WorkspaceContext` 提供稳定前缀，`LayeredMemory`
-        提供工作记忆，这个函数则把它们和当前请求合成一份可控大小的 prompt。
+        的最后一道组装工序。`WorkspaceContext` 提供稳定前缀，卡片存储
+        提供当前有效卡片，这个函数则把它们和当前请求合成一份可控大小的 prompt。
         """
         user_message = str(user_message)
         self.section_floors = self._compute_section_floors()
-        memory_enabled = True
-        relevant_memory_enabled = True
         context_reduction_enabled = True
         if hasattr(self.agent, "feature_enabled"):
-            memory_enabled = self.agent.feature_enabled("memory")
-            relevant_memory_enabled = self.agent.feature_enabled("relevant_memory")
             context_reduction_enabled = self.agent.feature_enabled("context_reduction")
+        selected_cards, omitted_card_ids, memory_error = self.agent.selected_memory(user_message)
         section_texts = {
             "prefix": str(getattr(self.agent, "prefix", "")),
             RECOVERY_NOTICE_SECTION: "",
-            "memory": "Memory:\n- disabled" if not memory_enabled else str(self.agent.memory_text()),
+            "saved_memory": "",
             "history": "",
             CURRENT_REQUEST_SECTION: f"Current user request:\n{user_message}",
         }
@@ -280,27 +272,25 @@ class ContextManager:
             recovery_notice = str(self.agent.render_recovery_notice() or "").strip()
         if recovery_notice:
             section_texts[RECOVERY_NOTICE_SECTION] = recovery_notice
-        selected_notes = []
-        if memory_enabled and relevant_memory_enabled and hasattr(self.agent, "memory") and hasattr(self.agent.memory, "retrieval_candidates"):
-            selected_notes = self.agent.memory.retrieval_candidates(user_message, limit=RELEVANT_MEMORY_LIMIT)
-
         if not context_reduction_enabled:
-            rendered = self._render_sections_without_reduction(section_texts, selected_notes=selected_notes)
+            rendered = self._render_sections_without_reduction(section_texts, selected_cards=selected_cards)
             prompt = self._assemble_prompt(rendered)
             metadata = self._metadata(
                 prompt=prompt,
                 rendered=rendered,
                 budgets={section: render.budget for section, render in rendered.items() if section != CURRENT_REQUEST_SECTION},
                 reduction_log=[],
-                selected_notes=selected_notes,
+                selected_cards=selected_cards,
+                omitted_card_ids=omitted_card_ids,
+                memory_error=memory_error,
                 user_message=user_message,
                 section_texts=section_texts,
             )
             return prompt, metadata
 
         budgets = dict(self.section_budgets)
-        budgets.update(self._dynamic_section_budgets(section_texts, selected_notes))
-        rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
+        budgets.update(self._dynamic_section_budgets(section_texts, selected_cards))
+        rendered = self._render_sections(section_texts, budgets, selected_cards=selected_cards)
         prompt = self._assemble_prompt(rendered)
         reduction_log = []
         budget_trigger = self._budget_trigger(prompt)
@@ -327,7 +317,7 @@ class ContextManager:
                     }
                 )
                 budgets["history"] = after_budget
-                rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
+                rendered = self._render_sections(section_texts, budgets, selected_cards=selected_cards)
                 prompt = self._assemble_prompt(rendered)
 
         # 如果仍然超过输入硬预算，就继续按固定顺序兜底压缩。
@@ -357,7 +347,7 @@ class ContextManager:
                     }
                 )
                 budgets[section] = new_budget
-                rendered = self._render_sections(section_texts, budgets, selected_notes=selected_notes)
+                rendered = self._render_sections(section_texts, budgets, selected_cards=selected_cards)
                 prompt = self._assemble_prompt(rendered)
                 reduced = True
                 break
@@ -369,7 +359,9 @@ class ContextManager:
             rendered=rendered,
             budgets=budgets,
             reduction_log=reduction_log,
-            selected_notes=selected_notes,
+            selected_cards=selected_cards,
+            omitted_card_ids=omitted_card_ids,
+            memory_error=memory_error,
             user_message=user_message,
             section_texts=section_texts,
             budget_trigger=budget_trigger,
@@ -397,34 +389,23 @@ class ContextManager:
             return "soft"
         return "none"
 
-    def _dynamic_section_budgets(self, section_texts, selected_notes):
+    def _dynamic_section_budgets(self, section_texts, selected_cards):
         prefix_budget = min(int(self.section_budgets.get("prefix", DEFAULT_SECTION_TARGETS["prefix"])), self.section_max["prefix"])
-        memory_budget = min(int(self.section_budgets.get("memory", DEFAULT_SECTION_TARGETS["memory"])), self.section_max["memory"])
-        relevant_budget = min(
-            int(self.section_budgets.get("relevant_memory", DEFAULT_SECTION_TARGETS["relevant_memory"])),
-            self.section_max["relevant_memory"],
-        )
+        memory_budget = min(int(self.section_budgets.get("saved_memory", DEFAULT_SECTION_TARGETS["saved_memory"])), self.section_max["saved_memory"])
         request_tokens = estimate_tokens(section_texts[CURRENT_REQUEST_SECTION])
         recovery_tokens = estimate_tokens(section_texts.get(RECOVERY_NOTICE_SECTION, ""))
-        fixed_tokens = prefix_budget + memory_budget + relevant_budget + recovery_tokens + request_tokens
+        fixed_tokens = prefix_budget + memory_budget + recovery_tokens + request_tokens
         history_budget = max(self.min_history_tokens, self._input_hard_budget() - fixed_tokens)
         if "history" in self.section_budgets and self.section_budgets["history"] != DEFAULT_SECTION_BUDGETS["history"]:
             history_budget = min(history_budget, int(self.section_budgets["history"]))
         return {
             "prefix": prefix_budget,
-            "memory": memory_budget,
-            "relevant_memory": relevant_budget,
+            "saved_memory": memory_budget,
             "history": history_budget,
         }
 
-    def _render_sections_without_reduction(self, section_texts, selected_notes=None):
-        selected_notes = selected_notes or []
-        relevant_lines = ["Relevant memory:"]
-        if selected_notes:
-            relevant_lines.extend(f"- {note['text']}" for note in selected_notes)
-        else:
-            relevant_lines.append("- none")
-        relevant_raw = "\n".join(relevant_lines)
+    def _render_sections_without_reduction(self, section_texts, selected_cards=None):
+        selected_cards = selected_cards or []
         history = list(getattr(self.agent, "session", {}).get("history", []))
         history_raw = self._raw_history_text(history)
         return {
@@ -435,19 +416,7 @@ class ContextManager:
                 rendered=section_texts[RECOVERY_NOTICE_SECTION],
                 details={},
             ),
-            "memory": SectionRender(raw=section_texts["memory"], budget=len(section_texts["memory"]), rendered=section_texts["memory"], details={}),
-            "relevant_memory": SectionRender(
-                raw=relevant_raw,
-                budget=len(relevant_raw),
-                rendered=relevant_raw,
-                details={
-                    "selected_notes": [note["text"] for note in selected_notes],
-                    "rendered_notes": [note["text"] for note in selected_notes],
-                    "selected_count": len(selected_notes),
-                    "rendered_count": len(selected_notes),
-                    "note_budget": 0,
-                },
-            ),
+            "saved_memory": self._render_saved_memory(selected_cards, 100_000),
             "history": SectionRender(raw=history_raw, budget=len(history_raw), rendered=history_raw, details={"rendered_entries": []}),
             CURRENT_REQUEST_SECTION: SectionRender(
                 raw=section_texts[CURRENT_REQUEST_SECTION],
@@ -462,18 +431,20 @@ class ContextManager:
             section: max(20, int(budget) // 4)
             for section, budget in self.section_budgets.items()
         }
+        floors["saved_memory"] = 0
+        floors["history"] = min(self.min_history_tokens, int(self.section_budgets.get("history", 0)))
         floors.update(self._section_floor_overrides)
         return floors
 
-    def _render_sections(self, section_texts, budgets, selected_notes=None):
+    def _render_sections(self, section_texts, budgets, selected_cards=None):
         rendered = {}
         for section in SECTION_ORDER:
             budget = budgets.get(section)
             if section == CURRENT_REQUEST_SECTION:
                 raw = section_texts[section]
                 rendered[section] = SectionRender(raw=raw, budget=0, rendered=raw, details={})
-            elif section == "relevant_memory":
-                rendered[section] = self._render_relevant_memory(selected_notes or [], int(budget or 0))
+            elif section == "saved_memory":
+                rendered[section] = self._render_saved_memory(selected_cards or [], int(budget or 0))
             elif section == "history":
                 rendered[section] = self._render_history_section(int(budget or 0))
             else:
@@ -482,59 +453,23 @@ class ContextManager:
                 rendered[section] = SectionRender(raw=raw, budget=int(budget) if budget is not None else 0, rendered=rendered_text, details={})
         return rendered
 
-    def _render_relevant_memory(self, selected_notes, budget):
-        header = "Relevant memory:"
-        note_texts = [str(note.get("text", "")) for note in selected_notes if str(note.get("text", "")).strip()]
-        raw_lines = [header] + [f"- {text}" for text in note_texts]
-        raw = "\n".join(raw_lines) if note_texts else "\n".join([header, "- none"])
-        if not note_texts:
-            rendered = raw
-            return SectionRender(
-                raw=raw,
-                budget=budget,
-                rendered=rendered,
-                details={
-                    "selected_notes": [],
-                    "rendered_notes": [],
-                    "selected_count": 0,
-                    "rendered_count": 0,
-                    "note_budget": 0,
-                },
-            )
-
-        per_note_budget = self._per_note_budget(budget, len(note_texts), header)
-        rendered_notes = []
-        while True:
-            # 让每条 note 平分这一段的预算，避免一条超长笔记把其他笔记都挤掉。
-            rendered_notes = [_token_clip(text, per_note_budget) for text in note_texts]
-            rendered = "\n".join([header] + [f"- {text}" for text in rendered_notes])
-            if estimate_tokens(rendered) <= budget or per_note_budget <= 1:
-                break
-            per_note_budget -= 1
-
-        if estimate_tokens(rendered) > budget and budget > 0:
-            rendered = _token_clip(raw, budget)
-            rendered_notes = [rendered]
-
+    def _render_saved_memory(self, cards, budget):
+        header = "Saved user preferences and explicit notes (lower priority than this request):"
+        lines = [f"- [{card['scope']}] {card['display_text']}" for card in cards]
+        raw = "\n".join([header, *lines]) if lines else ""
+        kept = []
+        kept_ids = []
+        for card, line in zip(cards, lines):
+            candidate = "\n".join([header, *kept, line])
+            if estimate_tokens(candidate) > budget:
+                continue
+            kept.append(line)
+            kept_ids.append(card["id"])
+        rendered = "\n".join([header, *kept]) if kept else ""
         return SectionRender(
-            raw=raw,
-            budget=budget,
-            rendered=rendered,
-            details={
-                "selected_notes": note_texts,
-                "rendered_notes": rendered_notes,
-                "selected_count": len(note_texts),
-                "rendered_count": len(rendered_notes),
-                "note_budget": per_note_budget,
-            },
+            raw=raw, budget=budget, rendered=rendered,
+            details={"selected_card_ids": kept_ids, "omitted_card_ids": [card["id"] for card in cards if card["id"] not in kept_ids]},
         )
-
-    def _per_note_budget(self, budget, note_count, header):
-        if note_count <= 0:
-            return 0
-        overhead = estimate_tokens(header) + note_count
-        usable = max(0, budget - overhead)
-        return max(1, usable // note_count)
 
     def _render_history_section(self, budget):
         history = list(getattr(self.agent, "session", {}).get("history", []))
@@ -550,7 +485,6 @@ class ContextManager:
             "older_entries_count": 0,
             "collapsed_duplicate_reads": 0,
             "collapsed_duplicate_tools": 0,
-            "reused_file_summary_count": 0,
             "summarized_tool_count": 0,
             "head_tail_clipped_tool_count": 0,
             "recent_tool_clipped_count": 0,
@@ -628,7 +562,6 @@ class ContextManager:
             "older_entries_count": max(0, recent_start),
             "collapsed_duplicate_reads": 0,
             "collapsed_duplicate_tools": 0,
-            "reused_file_summary_count": 0,
             "summarized_tool_count": 0,
             "head_tail_clipped_tool_count": 0,
             "recent_tool_clipped_count": 0,
@@ -647,7 +580,6 @@ class ContextManager:
         details = {
             "collapsed_duplicate_reads": 0,
             "collapsed_duplicate_tools": 0,
-            "reused_file_summary_count": 0,
             "summarized_tool_count": 0,
             "head_tail_clipped_tool_count": 0,
             "recent_tool_clipped_count": 0,
@@ -763,70 +695,6 @@ class ContextManager:
             return (name, str(args.get("path", "")).strip())
         return (name, json.dumps(args, sort_keys=True))
 
-    def _compressed_history_entries(self, history, recent_start):
-        entries = []
-        seen_older_reads = set()
-        details = {
-            "older_entries_count": 0,
-            "collapsed_duplicate_reads": 0,
-            "reused_file_summary_count": 0,
-            "summarized_tool_count": 0,
-        }
-
-        for index, item in enumerate(history):
-            recent = index >= recent_start
-            if recent:
-                line_limit = 900
-                entries.append(
-                    {
-                        "recent": True,
-                        "lines": self._render_history_item(item, line_limit),
-                    }
-                )
-                continue
-
-            if item["role"] == "tool" and item["name"] == "read_file":
-                path = str(item["args"].get("path", "")).strip()
-                if path in seen_older_reads:
-                    details["collapsed_duplicate_reads"] += 1
-                    continue
-                seen_older_reads.add(path)
-                summary = self._reusable_file_summary(path)
-                if summary:
-                    entries.append({"recent": False, "lines": [f"{path} -> {summary}"]})
-                    details["older_entries_count"] += 1
-                    details["reused_file_summary_count"] += 1
-                    continue
-
-            if item["role"] == "tool":
-                summary_line = self._summarize_old_tool_item(item)
-                entries.append({"recent": False, "lines": [summary_line]})
-                details["older_entries_count"] += 1
-                details["summarized_tool_count"] += 1
-                continue
-
-            entries.append({"recent": False, "lines": self._render_history_item(item, 60)})
-
-        return entries, details
-
-    def _reusable_file_summary(self, path):
-        memory = getattr(self.agent, "memory", None)
-        if memory is None or not hasattr(memory, "to_dict"):
-            return ""
-        snapshot = memory.to_dict()
-        summary = snapshot.get("file_summaries", {}).get(str(path), {})
-        if not summary:
-            return ""
-        return str(summary.get("summary", "")).strip()
-
-    def _summarize_old_tool_item(self, item):
-        if item["name"] == "run_shell":
-            command = str(item["args"].get("command", "")).strip() or "shell"
-            lines = [line.strip() for line in str(item.get("content", "")).splitlines() if line.strip()]
-            summary = " | ".join(lines[:3]) if lines else "(empty)"
-            return f"{command} -> {summary}"
-        return self._render_history_item(item, 60)[0]
-
     def _raw_history_text(self, history):
         if not history:
             return "Transcript:\n- empty"
@@ -848,21 +716,20 @@ class ContextManager:
 
     def _assemble_prompt(self, rendered):
         # 顺序与 SECTION_ORDER 一致：稳定 prefix + 大块 history 在前（利于前缀缓存），
-        # 易变的 memory/relevant_memory 随 current_request 一起放最后。
+        # 易变的 saved_memory 随 current_request 一起放最后。
         return "\n\n".join(
             section
             for section in [
                 rendered["prefix"].rendered,
                 rendered["history"].rendered,
-                rendered["memory"].rendered,
-                rendered["relevant_memory"].rendered,
+                rendered["saved_memory"].rendered,
                 rendered[RECOVERY_NOTICE_SECTION].rendered,
                 rendered[CURRENT_REQUEST_SECTION].rendered,
             ]
             if str(section).strip()
         ).strip()
 
-    def _metadata(self, prompt, rendered, budgets, reduction_log, selected_notes, user_message, section_texts, budget_trigger=None):
+    def _metadata(self, prompt, rendered, budgets, reduction_log, selected_cards, omitted_card_ids, memory_error, user_message, section_texts, budget_trigger=None):
         section_metadata = {}
         for section in SECTION_ORDER[:-1]:
             section_metadata[section] = {
@@ -906,20 +773,9 @@ class ContextManager:
             "sections": section_metadata,
             "budget_reductions": reduction_log,
             "reduction_order": list(self.reduction_order),
-            "relevant_memory": {
-                "limit": RELEVANT_MEMORY_LIMIT,
-                "selected_count": len(selected_notes),
-                "selected_notes": [note["text"] for note in selected_notes],
-                "selected_sources": [str(note.get("source", "")).strip() for note in selected_notes],
-                "selected_kinds": [str(note.get("kind", "episodic")).strip() or "episodic" for note in selected_notes],
-                "selected_durable_count": sum(
-                    1 for note in selected_notes if (str(note.get("kind", "episodic")).strip() or "episodic") == "durable"
-                ),
-                "raw_chars": rendered["relevant_memory"].raw_chars,
-                "rendered_chars": rendered["relevant_memory"].rendered_chars,
-                "rendered_notes": list(rendered["relevant_memory"].details.get("rendered_notes", [])),
-                "rendered_count": int(rendered["relevant_memory"].details.get("rendered_count", 0)),
-            },
+            "selected_card_ids": list(rendered["saved_memory"].details.get("selected_card_ids", [])),
+            "omitted_card_ids": list(dict.fromkeys([*omitted_card_ids, *rendered["saved_memory"].details.get("omitted_card_ids", [])])),
+            "saved_memory_error": memory_error,
             "history": {
                 "raw_chars": rendered["history"].raw_chars,
                 "rendered_chars": rendered["history"].rendered_chars,
@@ -932,7 +788,6 @@ class ContextManager:
                 "older_entries_count": int(rendered["history"].details.get("older_entries_count", 0)),
                 "collapsed_duplicate_reads": int(rendered["history"].details.get("collapsed_duplicate_reads", 0)),
                 "collapsed_duplicate_tools": int(rendered["history"].details.get("collapsed_duplicate_tools", 0)),
-                "reused_file_summary_count": int(rendered["history"].details.get("reused_file_summary_count", 0)),
                 "summarized_tool_count": int(rendered["history"].details.get("summarized_tool_count", 0)),
                 "head_tail_clipped_tool_count": int(rendered["history"].details.get("head_tail_clipped_tool_count", 0)),
                 "recent_tool_clipped_count": int(rendered["history"].details.get("recent_tool_clipped_count", 0)),

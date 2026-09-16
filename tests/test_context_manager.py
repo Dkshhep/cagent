@@ -20,6 +20,16 @@ def build_agent(tmp_path, outputs, **kwargs):
     )
 
 
+def add_card(agent, key, value, *, scope="project", display=None):
+    action, card = agent.memory_store.commit({
+        "op": "add", "target_card_id": "", "key": key, "kind": "preference", "scope": scope,
+        "tags": ["coding"], "current_value": value, "display_text": display or value,
+        "change_note": "", "source": {"authorization_turn_id": "test", "content_turn_ids": ["test"], "user_quote": "test"},
+    })
+    assert action == "added"
+    return card
+
+
 def test_estimate_tokens_reflects_text_shape():
     english = estimate_tokens("hello world " * 40)
     chinese = estimate_tokens("预算分配" * 40)
@@ -33,40 +43,39 @@ def test_estimate_tokens_reflects_text_shape():
 
 def test_context_manager_assembles_sections_in_expected_order(tmp_path):
     agent = build_agent(tmp_path, [])
-    agent.memory.append_note("deploy key is red", tags=("deploy",), created_at="2026-04-07T10:00:00+00:00")
+    add_card(agent, "coding.comment_language", "中文", display="当前项目注释用中文。")
     agent.record({"role": "user", "content": "old request", "created_at": "2026-04-07T09:59:00+00:00"})
     agent.record({"role": "assistant", "content": "old answer", "created_at": "2026-04-07T10:00:30+00:00"})
 
     prompt, metadata = ContextManager(agent).build("Where is the deploy key?")
 
     assert prompt.index("You are cagent") < prompt.index("Transcript:")
-    assert prompt.index("Transcript:") < prompt.index("Memory:")
-    assert prompt.index("Memory:") < prompt.index("Relevant memory:")
-    assert prompt.index("Relevant memory:") < prompt.index("Current user request:")
+    assert prompt.index("Transcript:") < prompt.index("Saved user preferences")
+    assert prompt.index("Saved user preferences") < prompt.index("Current user request:")
     assert prompt.rstrip().endswith("Current user request:\nWhere is the deploy key?")
-    assert metadata["section_order"] == ["prefix", "history", "memory", "relevant_memory", "recovery_notice", "current_request"]
+    assert metadata["section_order"] == ["prefix", "history", "saved_memory", "recovery_notice", "current_request"]
 
 
 def test_context_manager_places_recovery_notice_near_current_request(tmp_path):
     agent = build_agent(tmp_path, [])
+    add_card(agent, "coding.comment_language", "中文", display="当前项目注释用中文。")
     agent.record({"role": "user", "content": "old request", "created_at": "2026-04-07T09:59:00+00:00"})
     agent.render_recovery_notice = lambda: "Recovery warning:\nInspect before continuing"
 
     prompt, metadata = ContextManager(agent).build("Continue")
 
-    assert prompt.index("Relevant memory:") < prompt.index("Recovery warning:")
+    assert prompt.index("Saved user preferences") < prompt.index("Recovery warning:")
     assert prompt.index("Recovery warning:") < prompt.index("Current user request:")
     assert metadata["sections"]["prefix"]["rendered_chars"] == len(agent.prefix)
     assert metadata["sections"]["recovery_notice"]["rendered_chars"] > 0
 
 
-def test_context_manager_reduces_relevant_memory_before_history_and_preserves_newer_context(tmp_path):
+def test_context_manager_reduces_saved_memory_and_history_and_preserves_newer_context(tmp_path):
     agent = build_agent(tmp_path, [])
     agent.prefix = "PREFIX " + ("A" * 600)
-    agent.memory.render_memory_text = lambda: "MEMORY " + ("B" * 600)
-    agent.memory.append_note("keep episodic note one " + ("C" * 220), tags=("keep",), created_at="2026-04-07T10:00:00+00:00")
-    agent.memory.append_note("keep episodic note two " + ("D" * 220), tags=("keep",), created_at="2026-04-07T10:01:00+00:00")
-    agent.memory.append_note("keep episodic note three " + ("E" * 220), tags=("keep",), created_at="2026-04-07T10:02:00+00:00")
+    add_card(agent, "coding.first", "C" * 150)
+    add_card(agent, "coding.second", "D" * 150)
+    add_card(agent, "coding.third", "E" * 150)
     agent.record({"role": "user", "content": "OLD-CONTEXT " + ("D" * 260), "created_at": "2026-04-07T09:59:00+00:00"})
     for minute in range(1, 8):
         role = "assistant" if minute % 2 == 1 else "user"
@@ -78,20 +87,17 @@ def test_context_manager_reduces_relevant_memory_before_history_and_preserves_ne
         total_budget=1200,
         section_budgets={
             "prefix": 120,
-            "memory": 120,
-            "relevant_memory": 120,
+            "saved_memory": 120,
             "history": 400,
         },
     )
 
     prompt, metadata = manager.build("keep this request verbatim")
 
-    for section in ("prefix", "memory", "relevant_memory", "history"):
+    for section in ("prefix", "saved_memory", "history"):
         assert metadata["sections"][section]["rendered_chars"] <= metadata["sections"][section]["budget_chars"]
 
-    reduction_sections = [entry["section"] for entry in metadata["budget_reductions"]]
-    assert reduction_sections[0] == "history"
-    assert reduction_sections
+    assert metadata["history"]["history_count"] == 8
     assert "keep this request verbatim" in prompt
     assert metadata["prompt_tokens_estimated"] <= metadata["prompt_token_budget"]
     assert metadata["sections"]["history"]["estimated_tokens"] <= metadata["sections"]["history"]["budget_tokens"]
@@ -102,14 +108,15 @@ def test_context_manager_history_budget_tracks_current_request_size(tmp_path):
     manager = ContextManager(
         agent,
         total_budget=500,
-        section_budgets={"prefix": 80, "memory": 40, "relevant_memory": 30},
+        section_budgets={"prefix": 80, "saved_memory": 40},
         min_history_tokens=20,
     )
 
     _, short_metadata = manager.build("short")
     _, long_metadata = manager.build("long request " + ("detail " * 120))
-
-    assert short_metadata["section_token_budgets"]["history"] > long_metadata["section_token_budgets"]["history"]
+    short_budget = manager._dynamic_section_budgets({"current_request": "Current user request:\nshort", "recovery_notice": ""}, [])
+    long_budget = manager._dynamic_section_budgets({"current_request": "Current user request:\n" + ("detail " * 120), "recovery_notice": ""}, [])
+    assert short_budget["history"] > long_budget["history"]
     assert long_metadata["sections"]["current_request"]["estimated_tokens"] > short_metadata["sections"]["current_request"]["estimated_tokens"]
 
 
@@ -125,51 +132,33 @@ def test_context_manager_rejects_current_request_over_hard_max(tmp_path):
         raise AssertionError("expected oversized current request to be rejected")
 
 
-def test_context_manager_renders_top_three_episodic_notes_per_note_under_budget(tmp_path):
+def test_context_manager_omits_whole_cards_under_budget(tmp_path):
     agent = build_agent(tmp_path, [])
-    agent.memory.append_note("alpha episodic note " + ("A" * 120), tags=("recall",), created_at="2026-04-07T10:00:00+00:00")
-    agent.memory.append_note("beta episodic recall note " + ("B" * 120), created_at="2026-04-07T10:01:00+00:00")
-    agent.memory.append_note("gamma episodic note " + ("C" * 120), tags=("recall",), created_at="2026-04-07T10:02:00+00:00")
-    agent.memory.append_note("older unmatched note", created_at="2026-04-07T09:59:00+00:00")
-    agent.memory.append_note("Unrelated note", created_at="2026-04-07T11:00:00+00:00")
+    cards = [add_card(agent, f"coding.rule_{index}", str(index), display=f"规则{index}：" + ("中文" * 50)) for index in range(4)]
 
     prompt, metadata = ContextManager(
         agent,
-        total_budget=250,
+        total_budget=400,
         section_budgets={
             "prefix": 60,
-            "memory": 60,
-            "relevant_memory": 80,
+            "saved_memory": 80,
             "history": 60,
         },
-    ).build("recall")
+    ).build("规则")
 
-    assert metadata["relevant_memory"]["selected_count"] == 3
-    assert metadata["relevant_memory"]["limit"] == 3
-    assert metadata["relevant_memory"]["selected_notes"] == [
-        "gamma episodic note " + ("C" * 120),
-        "alpha episodic note " + ("A" * 120),
-        "beta episodic recall note " + ("B" * 120),
-    ]
-    assert len(metadata["relevant_memory"]["rendered_notes"]) == 3
-    assert metadata["relevant_memory"]["rendered_count"] == 3
-    assert metadata["relevant_memory"]["rendered_notes"][0].startswith("gamma episodi")
-    assert metadata["relevant_memory"]["rendered_notes"][1].startswith("alpha episodi")
-    assert metadata["relevant_memory"]["rendered_notes"][2].startswith("beta episodi")
-    relevant_section = prompt.split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
-    assert len([line for line in relevant_section.splitlines() if line.startswith("- ")]) == 3
-    assert "alpha episodi" in relevant_section
-    assert "beta episodic" in relevant_section
-    assert "gamma episodi" in relevant_section
-    assert "older unmatched note" not in relevant_section
+    assert len(metadata["selected_card_ids"]) < 4
+    assert set(metadata["selected_card_ids"] + metadata["omitted_card_ids"]) == {card["id"] for card in cards}
+    for card in cards:
+        if card["id"] not in metadata["selected_card_ids"]:
+            assert card["display_text"] not in prompt
 
 
 def test_context_manager_preserves_current_request_when_over_budget(tmp_path):
     agent = build_agent(tmp_path, [])
     agent.prefix = "PREFIX " + ("A" * 600)
-    agent.memory.render_memory_text = lambda: "MEMORY " + ("B" * 600)
-    agent.memory.retrieval_view = lambda query, limit=3: "Relevant memory:\n" + "\n".join(f"- {i} " + ("C" * 220) for i in range(5))
-    agent.history_text = lambda: "Transcript:\n" + "\n".join(f"[user] {i} " + ("D" * 220) for i in range(5))
+    add_card(agent, "coding.comment_language", "中文", display="当前项目注释用中文。")
+    for index in range(5):
+        agent.record({"role": "user", "content": f"history-{index} " + ("D" * 220)})
 
     request = "please preserve this request exactly"
     prompt, metadata = ContextManager(
@@ -177,8 +166,7 @@ def test_context_manager_preserves_current_request_when_over_budget(tmp_path):
         total_budget=250,
         section_budgets={
             "prefix": 80,
-            "memory": 80,
-            "relevant_memory": 80,
+            "saved_memory": 80,
             "history": 80,
         },
     ).build(request)
@@ -192,8 +180,6 @@ def test_context_manager_collapses_older_duplicate_reads_without_file_summary(tm
     file_path = tmp_path / "sample.txt"
     file_path.write_text("alpha\nbeta\n", encoding="utf-8")
     agent = build_agent(tmp_path, [])
-    agent.memory.set_file_summary("sample.txt", "alpha | beta")
-    agent.memory.remember_file("sample.txt")
 
     for created_at in ("2026-04-07T09:00:00+00:00", "2026-04-07T09:01:00+00:00"):
         agent.record(
@@ -222,11 +208,11 @@ def test_context_manager_collapses_older_duplicate_reads_without_file_summary(tm
         total_budget=100000,
         section_budgets={"history": 160},
     ).build("check the file")
-    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nMemory:", 1)[0]
+    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nCurrent user request:", 1)[0]
 
     assert "sample.txt -> alpha | beta" not in transcript
     assert metadata["history"]["collapsed_duplicate_reads"] == 1
-    assert metadata["history"]["reused_file_summary_count"] == 0
+    assert "reused_file_summary_count" not in metadata["history"]
 
 
 def test_context_manager_head_tail_clips_older_tool_output(tmp_path):
@@ -257,14 +243,14 @@ def test_context_manager_head_tail_clips_older_tool_output(tmp_path):
         total_budget=100000,
         section_budgets={"history": 260},
     ).build("check failures")
-    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nMemory:", 1)[0]
+    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nCurrent user request:", 1)[0]
 
     assert "START pytest" in transcript
     assert "FINAL ERROR summary" in transcript
     assert "中间内容已裁剪" in transcript
     assert metadata["history"]["summarized_tool_count"] == 1
     assert metadata["history"]["head_tail_clipped_tool_count"] == 1
-    assert metadata["history"]["reused_file_summary_count"] == 0
+    assert "reused_file_summary_count" not in metadata["history"]
 
 
 def test_context_manager_marks_distillation_candidate_for_long_history(tmp_path):
@@ -317,7 +303,7 @@ def test_context_manager_recent_tool_is_clipped_only_when_needed(tmp_path):
         total_budget=100000,
         section_budgets={"history": 180},
     ).build("continue")
-    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nMemory:", 1)[0]
+    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nCurrent user request:", 1)[0]
 
     assert "RECENT TOOL START" in transcript
     assert "RECENT TOOL FINAL ERROR" in transcript
@@ -341,7 +327,7 @@ def test_context_manager_final_fallback_protects_head_three_and_converges(tmp_pa
         total_budget=100000,
         section_budgets={"history": 120},
     ).build("continue")
-    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nMemory:", 1)[0]
+    transcript = prompt.split("\n\nTranscript:\n", 1)[1].split("\n\nCurrent user request:", 1)[0]
 
     assert "KEEP-HEAD-0" in transcript
     assert "KEEP-HEAD-1" in transcript
@@ -350,7 +336,7 @@ def test_context_manager_final_fallback_protects_head_three_and_converges(tmp_pa
     assert metadata["history"]["final_fallback_clipped_count"] > 0
 
 
-def test_context_manager_relevant_memory_can_mix_durable_notes(tmp_path):
+def test_context_manager_ignores_legacy_topics(tmp_path):
     memory_root = tmp_path / ".cagent" / "memory"
     topics_dir = memory_root / "topics"
     topics_dir.mkdir(parents=True)
@@ -375,10 +361,5 @@ def test_context_manager_relevant_memory_can_mix_durable_notes(tmp_path):
     agent = build_agent(tmp_path, [])
 
     prompt, metadata = ContextManager(agent).build("What conventions should I follow?")
-    relevant_section = prompt.split("Relevant memory:\n", 1)[1].split("\n\nTranscript:", 1)[0]
-
-    assert "Use constrained tools instead of guessing." in relevant_section
-    assert any("Use constrained tools instead of guessing." in item for item in metadata["relevant_memory"]["selected_notes"])
-    assert metadata["relevant_memory"]["selected_durable_count"] == 1
-    assert metadata["relevant_memory"]["selected_sources"] == ["project-conventions"]
-    assert metadata["relevant_memory"]["selected_kinds"] == ["durable"]
+    assert "Use constrained tools instead of guessing." not in prompt
+    assert metadata["selected_card_ids"] == []

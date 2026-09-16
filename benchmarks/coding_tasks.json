@@ -88,23 +88,22 @@
         "total_budget": 700,
         "section_budgets": {
           "prefix": 800,
-          "memory": 800,
-          "relevant_memory": 800,
+          "saved_memory": 600,
           "history": 2400
         }
       }
     },
     {
-      "id": "stale_summary_invalidation",
-      "prompt": "Continue the benchmark task without trusting the stale file summary.",
+      "id": "legacy_file_summary_ignored",
+      "prompt": "Continue the benchmark task without trusting the legacy file summary.",
       "fixture_repo": "tests/fixtures/bench_repo_patch",
       "allowed_tools": ["read_file"],
       "step_budget": 3,
-      "expected_artifact": "sample.txt exists and stale summary is invalidated without recovery",
-      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); session = json.loads(next(Path('.cagent/sessions').glob('*.json')).read_text(encoding='utf-8')); assert report['recovery']['status'] == 'clean'; assert 'sample.txt' not in session['memory']['file_summaries']\"",
+      "expected_artifact": "sample.txt exists and legacy summary is ignored without recovery",
+      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); session = json.loads(next(Path('.cagent/sessions').glob('*.json')).read_text(encoding='utf-8')); assert report['recovery']['status'] == 'clean'; assert 'sample.txt' in session['memory']['file_summaries']; assert report['legacy_memory_present']\"",
       "category": "recovery",
       "setup": {
-        "kind": "freshness_mismatch",
+        "kind": "legacy_file_summary",
         "path": "sample.txt",
         "summary": "sample.txt: benchmark stale summary",
         "mutated_text": "alpha\nbeta\ngamma\nstale-updated\n"
@@ -124,24 +123,24 @@
       }
     },
     {
-      "id": "durable_promotion_accept",
-      "prompt": "Capture the stable benchmark facts as durable memory and respond with only the promoted facts.",
+      "id": "memory_preference_save",
+      "prompt": "记住：这个项目以后注释用中文。",
       "fixture_repo": "tests/fixtures/bench_repo_readme",
       "allowed_tools": ["read_file"],
       "step_budget": 2,
-      "expected_artifact": "README.md fixture stays available while durable promotion succeeds",
-      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); conventions = Path('.cagent/memory/topics/project-conventions.md').read_text(encoding='utf-8'); assert len(report['durable_promotions']) == 2; assert 'Preserve benchmark regression artifacts under artifacts/.' in conventions\"",
-      "category": "durable-contract"
+      "expected_artifact": "README.md fixture stays available while an authorized preference card is saved",
+      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); cards = json.loads(Path('.cagent/memory/cards.json').read_text(encoding='utf-8'))['cards']; assert report['memory_review_status'] == 'changed'; assert len(cards) == 1 and cards[0]['current_value'] == '中文'\"",
+      "category": "memory-contract"
     },
     {
-      "id": "durable_promotion_reject",
-      "prompt": "Capture only the stable benchmark facts into durable memory and reject anything transient or secret-shaped.",
+      "id": "memory_secret_reject",
+      "prompt": "记住：这个项目以后注释用中文。",
       "fixture_repo": "tests/fixtures/bench_repo_readme",
       "allowed_tools": ["read_file"],
       "step_budget": 2,
-      "expected_artifact": "README.md fixture stays available while durable rejection is recorded",
-      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); assert report['durable_rejections'] == ['dependency-facts:secret_shaped', 'key-decisions:transient_task_state']; assert report['durable_promotions'] == ['project-conventions: Keep verifier outcomes stable across reruns.']\"",
-      "category": "durable-contract"
+      "expected_artifact": "README.md fixture stays available while secret-shaped proposal is rejected",
+      "verifier": "python -c \"import json; from pathlib import Path; report = json.loads(next(Path('.cagent/runs').glob('*/report.json')).read_text(encoding='utf-8')); assert report['memory_review_status'] == 'failed'; assert report['memory_review_failure_reason'] == 'secret_shaped_content'; assert not Path('.cagent/memory/cards.json').exists()\"",
+      "category": "memory-contract"
     }
   ]
 }

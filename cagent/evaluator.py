@@ -10,7 +10,6 @@ from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from . import memory as memorylib
 from .models import FakeModelClient
 from .runtime import CAgent, SessionStore
 from .run_store import RunStore
@@ -90,17 +89,17 @@ SCRIPTED_MODEL_OUTPUTS = {
     "context_reduction_no_recovery": [
         "<final>Done.</final>",
     ],
-    "stale_summary_invalidation": [
+    "legacy_file_summary_ignored": [
         "<final>Done.</final>",
     ],
     "legacy_checkpoint_ignored": [
         "<final>Done.</final>",
     ],
-    "durable_promotion_accept": [
-        "<final>Project convention: Preserve benchmark regression artifacts under artifacts/.\nDecision: Keep harness regression deterministic and reproducible.</final>",
+    "memory_preference_save": [
+        "<final>Done.</final>",
     ],
-    "durable_promotion_reject": [
-        "<final>Project convention: Keep verifier outcomes stable across reruns.\nDependency: API key is sk-benchmark-secret.\nDecision: Current goal is debug the harness.</final>",
+    "memory_secret_reject": [
+        "<final>Done.</final>",
     ],
 }
 
@@ -304,7 +303,6 @@ def _apply_task_setup(agent, task, fixture_copy_root):
     kind = str(setup.get("kind", "")).strip()
     if kind == "context_reduction":
         history_count = int(setup.get("history_count", 12))
-        note_count = int(setup.get("note_count", 6))
         for index in range(history_count):
             agent.record(
                 {
@@ -313,44 +311,21 @@ def _apply_task_setup(agent, task, fixture_copy_root):
                     "created_at": f"2026-04-15T09:{index:02d}:00+00:00",
                 }
             )
-        for index in range(note_count):
-            agent.memory.append_note(
-                f"benchmark-note-{index}-" + ("B" * 180),
-                tags=("recall",),
-                created_at=f"2026-04-15T10:{index:02d}:00+00:00",
-            )
-        agent.session["memory"] = agent.memory.to_dict()
         agent.context_manager.total_budget = int(setup.get("total_budget", 900))
         agent.context_manager.section_budgets = dict(
             setup.get(
                 "section_budgets",
-                {"prefix": 120, "memory": 120, "relevant_memory": 120, "history": 160},
+                {"prefix": 120, "saved_memory": 120, "history": 160},
             )
         )
         return
 
-    if kind == "freshness_mismatch":
+    if kind == "legacy_file_summary":
         path = str(setup.get("path", "sample.txt"))
         summary_text = str(setup.get("summary", f"{path}: stale benchmark summary"))
-        agent.memory.set_file_summary(path, summary_text)
-        agent.memory.remember_file(path)
-        freshness = agent.memory.to_dict()["file_summaries"][path]["freshness"]
-        agent.session["memory"] = agent.memory.to_dict()
-        agent.session["checkpoints"] = {
-            "current_id": "ckpt_freshness",
-            "items": {
-                "ckpt_freshness": _checkpoint_payload(
-                    "ckpt_freshness",
-                    current_goal="Re-anchor stale benchmark file state",
-                    next_step=f"Re-read {path}",
-                    runtime_identity={"workspace_fingerprint": agent.workspace.fingerprint()},
-                    key_files=[{"path": path, "freshness": freshness}],
-                    freshness={path: freshness},
-                    summary="stale benchmark checkpoint",
-                )
-            },
-        }
+        agent.session["memory"] = {"file_summaries": {path: {"summary": summary_text}}}
         agent.session_store.save(agent.session)
+        agent.legacy_memory_present = agent.memory_store.legacy_present(agent.session)
         (fixture_copy_root / path).write_text(str(setup.get("mutated_text", "alpha\nbeta\nstale-updated\nplaceholder\n")), encoding="utf-8")
         return
 
@@ -369,6 +344,28 @@ def _apply_task_setup(agent, task, fixture_copy_root):
         }
         agent.session_store.save(agent.session)
         return
+
+
+class _BenchmarkMemoryDecider:
+    """仅用于合同场景；主控制循环仍由独立 FakeModelClient 驱动。"""
+
+    last_metadata = {"duration_ms": 0, "completion": {}}
+
+    def __init__(self, secret=False):
+        self.secret = secret
+
+    def review(self, user_turn, **kwargs):
+        value = "sk-benchmark-secret" if self.secret else "中文"
+        return {
+            "decision": "change",
+            "proposals": [{
+                "op": "add", "key": "coding.comment_language", "kind": "preference", "scope": "project",
+                "tags": ["coding", "comments"], "current_value": value,
+                "display_text": f"当前项目的代码注释使用{value}。", "change_note": "",
+                "authorization_turn_id": user_turn["turn_id"], "content_turn_ids": [user_turn["turn_id"]],
+                "user_quote": user_turn["content"],
+            }],
+        }
 
 
 class BenchmarkEvaluator:
@@ -466,13 +463,12 @@ class BenchmarkEvaluator:
             max_steps=int(task["step_budget"]),
             max_new_tokens=self.max_new_tokens,
         )
+        if task["id"] in {"memory_preference_save", "memory_secret_reject"}:
+            agent.memory_decider = _BenchmarkMemoryDecider(secret=task["id"] == "memory_secret_reject")
         _apply_task_setup(agent, task, fixture_copy_root)
 
         initial_history_empty = len(agent.session["history"]) == 0
-        initial_memory_state = agent.memory.to_dict()
-        initial_memory_empty = memorylib.is_effectively_empty(initial_memory_state)
-        initial_task_summary_empty = not str(initial_memory_state["working"]["task_summary"]).strip()
-        initial_episodic_notes_empty = not initial_memory_state["episodic_notes"]
+        initial_saved_memory_empty = not agent.memory_store.effective()
 
         final_answer = agent.ask(task["prompt"])
         task_state = agent.current_task_state
@@ -541,9 +537,7 @@ class BenchmarkEvaluator:
             "final_answer": final_answer,
             "stop_reason": task_state.stop_reason,
             "initial_history_empty": initial_history_empty,
-            "initial_memory_empty": initial_memory_empty,
-            "initial_task_summary_empty": initial_task_summary_empty,
-            "initial_episodic_notes_empty": initial_episodic_notes_empty,
+            "initial_saved_memory_empty": initial_saved_memory_empty,
             "task_state": task_state.to_dict(),
             "report": report,
         }

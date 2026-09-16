@@ -23,7 +23,7 @@ def test_load_benchmark_validates_fixed_schema():
         "text-edit": 2,
         "tool-boundary": 3,
         "recovery": 3,
-        "durable-contract": 2,
+        "memory-contract": 2,
     }
     for task in benchmark["tasks"]:
         assert {"id", "prompt", "fixture_repo", "allowed_tools", "step_budget", "expected_artifact", "verifier", "category"} <= set(task)
@@ -73,8 +73,7 @@ def test_run_fixed_benchmark_uses_fresh_fixture_copy_and_fresh_run_directory(tmp
     assert not row["fixture_copy_relpath"].startswith("/")
     assert not row["run_dir_relpath"].startswith("/")
     assert row["initial_history_empty"] is True
-    assert row["initial_memory_empty"] is True
-    assert row["initial_task_summary_empty"] is True
+    assert row["initial_saved_memory_empty"] is True
     assert Path("tests/fixtures/bench_repo_patch/sample.txt").read_text(encoding="utf-8") == original_fixture
     assert "beta-locked" in (copied_fixture / "sample.txt").read_text(encoding="utf-8")
 
@@ -131,7 +130,7 @@ def test_run_fixed_benchmark_reports_metadata_and_success_definition(tmp_path):
         assert row["stop_reason"] == "final_answer_returned"
 
 
-def test_run_fixed_benchmark_covers_recovery_and_durable_contract_rows(tmp_path):
+def test_run_fixed_benchmark_covers_recovery_and_memory_contract_rows(tmp_path):
     artifact = run_fixed_benchmark(
         benchmark_path=Path("benchmarks/coding_tasks.json"),
         artifact_path=tmp_path / "benchmark-v1.json",
@@ -139,17 +138,15 @@ def test_run_fixed_benchmark_covers_recovery_and_durable_contract_rows(tmp_path)
     )
 
     context_row = next(item for item in artifact["rows"] if item["id"] == "context_reduction_no_recovery")
-    durable_row = next(item for item in artifact["rows"] if item["id"] == "durable_promotion_reject")
+    memory_row = next(item for item in artifact["rows"] if item["id"] == "memory_secret_reject")
 
     trace_path = (tmp_path / "workspaces" / context_row["run_dir_relpath"] / "trace.jsonl").resolve()
     trace_events = [json.loads(line) for line in trace_path.read_text(encoding="utf-8").splitlines()]
 
     assert context_row["report"]["recovery"]["status"] == "clean"
     assert not any(event.get("event", "").startswith("recovery_checkpoint_") for event in trace_events)
-    assert durable_row["report"]["durable_rejections"] == [
-        "dependency-facts:secret_shaped",
-        "key-decisions:transient_task_state",
-    ]
+    assert memory_row["report"]["memory_review_status"] == "failed"
+    assert memory_row["report"]["memory_review_failure_reason"] == "secret_shaped_content"
 
 
 def test_run_harness_regression_v2_writes_named_artifact(tmp_path):

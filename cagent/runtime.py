@@ -1,7 +1,7 @@
 """Agent 运行时核心逻辑。
 
 CAgent 就是包在模型外面的控制循环：负责组 prompt、解析模型输出、
-校验并执行工具、写 trace、更新工作记忆，以及在合适的时候停下来。
+校验并执行工具、写 trace、审查用户授权的长期记忆，以及在合适的时候停下来。
 """
 
 import json
@@ -15,7 +15,17 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
-from . import memory as memorylib
+from .memory_cards import (
+    MemoryValidationError,
+    REFERENTIAL_MEMORY_PATTERN,
+    SECRET_PATTERN,
+    has_memory_intent,
+    is_explicit_request,
+    parse_decision,
+    select_cards,
+    validate_proposal,
+)
+from .memory_store import MemoryStore
 from .context_manager import ContextManager
 from .recovery import (
     READ_ONLY_INSPECTION_TOOLS,
@@ -45,27 +55,14 @@ DEFAULT_SHELL_ENV_ALLOWLIST = (
     "USERPROFILE", "PATHEXT", "COMSPEC", "NUMBER_OF_PROCESSORS", "PROCESSOR_ARCHITECTURE",
 )
 DEFAULT_FEATURE_FLAGS = {
-    "memory": True,
-    "relevant_memory": True,
+    "saved_memory": True,
+    "memory_review": True,
     "context_reduction": True,
     "prompt_cache": True,
     "context_distillation": True,
 }
 DISTILLATION_MAX_NEW_TOKENS = 800
 RETRY_RAW_RESPONSE_PREVIEW_CHARS = 2000
-DURABLE_MEMORY_INTENT_PATTERN = re.compile(r"(?i)\b(capture|remember|save|store|persist|note)\b")
-DURABLE_MEMORY_INTENT_ZH_PATTERN = re.compile(r"(记住|保存|记录|沉淀|长期记忆|持久记忆)")
-DURABLE_MEMORY_LINE_PATTERNS = (
-    ("project-conventions", re.compile(r"(?i)^Project convention:\s*(.+)$")),
-    ("key-decisions", re.compile(r"(?i)^Decision:\s*(.+)$")),
-    ("dependency-facts", re.compile(r"(?i)^Dependency:\s*(.+)$")),
-    ("user-preferences", re.compile(r"(?i)^Preference:\s*(.+)$")),
-    ("project-conventions", re.compile(r"^项目约定：\s*(.+)$")),
-    ("key-decisions", re.compile(r"^决策：\s*(.+)$")),
-    ("dependency-facts", re.compile(r"^依赖：\s*(.+)$")),
-    ("user-preferences", re.compile(r"^偏好：\s*(.+)$")),
-)
-SECRET_SHAPED_TEXT_PATTERN = re.compile(r"(?i)(\b(api[_ -]?key|token|secret|password)\b|sk-[A-Za-z0-9_-]{6,})")
 
 
 @dataclass
@@ -122,6 +119,8 @@ class CAgent:
         feature_flags=None,
         mcp_manager=None,
         shell_path_prepend=None,
+        memory_store=None,
+        memory_decider=None,
     ):
         self.model_client = model_client
         self.workspace = workspace
@@ -144,19 +143,15 @@ class CAgent:
             self.feature_flags.update({str(key): bool(value) for key, value in feature_flags.items()})
         self.mcp_manager = mcp_manager
         self.run_store = run_store or RunStore(Path(workspace.repo_root) / ".cagent" / "runs")
+        self.memory_store = memory_store or MemoryStore(self.root)
+        self.memory_decider = memory_decider
         self.session = session or {
             "id": datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:6],
             "created_at": now(),
             "workspace_root": workspace.repo_root,
             "history": [],
-            "memory": memorylib.default_memory_state(),
         }
         self._ensure_session_shape()
-        self.memory = memorylib.LayeredMemory(
-            self.session.setdefault("memory", memorylib.default_memory_state()),
-            workspace_root=self.root,
-        )
-        self.session["memory"] = self.memory.to_dict()
         self.tools = self.build_tools()
         self.prefix_state = self.build_prefix()
         self.prefix = self.prefix_state.text
@@ -169,9 +164,8 @@ class CAgent:
         self.current_run_dir = None
         self.last_prompt_metadata = {}
         self.last_completion_metadata = {}
-        self.last_durable_promotions = []
-        self.last_durable_rejections = []
-        self.last_durable_superseded = []
+        self.last_memory_review = {"status": "not_run", "changes": [], "failure_reason": ""}
+        self.legacy_memory_present = self.memory_store.legacy_present(self.session)
         self._last_tool_result_metadata = {}
         self._last_recovery_prepared = False
         self._run_recovery_summary = dict(self.recovery_state)
@@ -193,7 +187,11 @@ class CAgent:
 
     def _ensure_session_shape(self):
         self.session.setdefault("history", [])
-        self.session.setdefault("memory", memorylib.default_memory_state())
+        # 旧 session 的 memory 字段原样保留作兼容备份，但不再参与运行。
+        for item in self.session["history"]:
+            if item.get("role") in {"user", "assistant"} and not item.get("turn_id"):
+                if (item.get("metadata") or {}).get("kind") != "distilled_history":
+                    item["turn_id"] = "turn_" + uuid.uuid4().hex[:12]
 
     def current_runtime_identity(self):
         return {
@@ -211,14 +209,8 @@ class CAgent:
             "tool_signature": self.tool_signature(),
         }
 
-    def invalidate_stale_memory(self):
-        invalidated = self.memory.invalidate_stale_file_summaries()
-        self.session["memory"] = self.memory.to_dict()
-        return invalidated
-
     def evaluate_recovery_state(self):
         """只判断是否存在尚未确认的副作用，并为文件目标做保守比较。"""
-        self.invalidate_stale_memory()
         checkpoint = self.recovery_checkpoint
         if not checkpoint:
             return {"status": RECOVERY_CLEAN, "interrupted_tool": "", "target_changed": None}
@@ -409,7 +401,33 @@ class CAgent:
         return dict(self._last_prefix_refresh)
 
     def memory_text(self):
-        return self.memory.render_memory_text()
+        try:
+            cards = self.memory_store.effective()
+        except (OSError, ValueError, KeyError, TypeError):
+            return "Saved user preferences and explicit notes: unavailable"
+        if not cards:
+            return "Saved user preferences and explicit notes: none"
+        return "\n".join(
+            ["Saved user preferences and explicit notes (lower priority than this request):"]
+            + [f"- [{card['scope']}] {card['display_text']}" for card in cards]
+        )
+
+    def selected_memory(self, user_message):
+        """主 prompt 只取当前有效的卡片文本；错误不得阻断普通任务。"""
+        if not self.feature_enabled("saved_memory"):
+            return [], [], ""
+        try:
+            cards = self.memory_store.effective()
+            previous_goal = next(
+                (item.get("content", "") for item in reversed(self.session["history"][:-1])
+                 if item.get("role") == "user" and str(item.get("content", "")).strip() not in {"继续", "continue"}),
+                "",
+            )
+            query = f"{user_message}\n{previous_goal}"
+            selected, omitted = select_cards(cards, query)
+            return selected, omitted, ""
+        except (OSError, ValueError, KeyError, TypeError) as exc:
+            return [], [], exc.__class__.__name__
 
     def history_text(self):
         history = self.session["history"]
@@ -445,6 +463,8 @@ class CAgent:
         return prompt
 
     def record(self, item):
+        if item.get("role") in {"user", "assistant"} and not item.get("turn_id"):
+            item["turn_id"] = "turn_" + uuid.uuid4().hex[:12]
         self.session["history"].append(item)
         self.session_path = self.session_store.save(self.session)
 
@@ -541,7 +561,7 @@ class CAgent:
             {
                 "prefix_chars": len(self.prefix),
                 "workspace_chars": len(self.workspace.text()),
-                "memory_chars": len(self.memory_text()),
+                "saved_memory_chars": len(self.memory_text()),
                 "history_chars": len(self.history_text()),
                 "request_chars": len(user_message),
                 "tool_count": len(self.tools),
@@ -777,102 +797,101 @@ class CAgent:
                 summaries.append(f"modified:{path}")
         return changed_paths, summaries
 
-    def update_memory_after_tool(self, name, args, result):
-        """把少量高价值工具结果沉淀到 working memory。
+    def review_memory_after_turn(self, user_turn, final_candidate):
+        """主模型完成后独立审查记忆；不消耗工具步数，也不让 LLM 直接写盘。"""
+        user_message = str(user_turn.get("content", ""))
+        result = {"status": "no_change", "changes": [], "failure_reason": "", "duration_ms": 0, "completion": {}}
+        if not self.feature_enabled("memory_review") or not has_memory_intent(user_message):
+            self.last_memory_review = result
+            return result
+        if SECRET_PATTERN.search(user_message) or self.redact_text(user_message) != user_message:
+            result.update(status="failed", failure_reason="secret_shaped_request")
+            self.last_memory_review = result
+            return result
+        if self.memory_decider is None:
+            result.update(status="failed", failure_reason="memory_decider_unavailable")
+            self.last_memory_review = result
+            return result
+        turns = [
+            item for item in self.session["history"]
+            if item.get("role") in {"user", "assistant"} and item.get("turn_id")
+            and (item.get("metadata") or {}).get("kind") != "distilled_history"
+        ][-10:]
+        if REFERENTIAL_MEMORY_PATTERN.search(user_message) and not any(item["role"] == "assistant" for item in turns):
+            result["status"] = "needs_clarification"
+            self.last_memory_review = result
+            return result
+        # 本轮候选回答尚未经用户确认，不能伪装成“之前确认的结论”来源。
+        source_turns = {item["turn_id"]: item for item in turns}
+        safe_turns = [
+            {**item, "content": "[redacted sensitive turn]" if SECRET_PATTERN.search(str(item.get("content", ""))) else self.redact_text(str(item.get("content", "")))}
+            for item in turns
+        ]
+        safe_final = "[redacted sensitive answer]" if SECRET_PATTERN.search(final_candidate) else self.redact_text(final_candidate)
+        try:
+            # 同一轮读取的 revision 是乐观并发基线；提交时再加锁核对。
+            revisions = {scope: self.memory_store.read(scope)["revision"] for scope in ("project", "global")}
+            active_cards = self.memory_store.effective()
+            if self.redact_artifact(active_cards) != active_cards:
+                raise MemoryValidationError("sensitive_existing_card")
+            decision_value = self.memory_decider.review(
+                user_turn=user_turn,
+                recent_turns=safe_turns,
+                cards=active_cards,
+                final_candidate=safe_final,
+            )
+            decision, proposals = parse_decision(decision_value)
+            result["status"] = decision
+            if decision == "needs_clarification":
+                return result
+            validated = [validate_proposal(proposal, source_turns) for proposal in proposals]
+            for proposal in validated:
+                action, card = self.memory_store.commit(proposal, expected_revision=revisions[proposal["scope"]])
+                if action != "no_change":
+                    revisions[proposal["scope"]] += 1
+                    result["changes"].append({"action": action, "id": card["id"], "key": card["key"], "scope": card["scope"], "current_value": card["current_value"]})
+            result["status"] = "changed" if result["changes"] else "no_change"
+        except Exception as exc:
+            result.update(status="failed", failure_reason=str(exc) if isinstance(exc, MemoryValidationError) else exc.__class__.__name__)
+        finally:
+            metadata = getattr(self.memory_decider, "last_metadata", {}) or {}
+            result["duration_ms"] = int(metadata.get("duration_ms", 0))
+            result["completion"] = dict(metadata.get("completion", {}) or {})
+            self.last_memory_review = result
+        return result
 
-        为什么存在：
-        并不是每个工具结果都值得长期带进下一轮 prompt。完整结果已经进了
-        `history`，这里只挑少量“下一轮大概率还会用到”的事实做提纯，
-        例如最近读写过哪些文件、某个文件读出来的短摘要。
-
-        输入 / 输出：
-        - 输入：工具名 `name`、参数 `args`、执行结果 `result`
-        - 输出：无显式返回值，副作用是更新 `self.memory`
-
-        在 agent 链路里的位置：
-        它发生在 `run_tool()` 真正执行完工具之后、下一轮 prompt 组装之前。
-        也就是说：工具结果先进入完整历史，再由这个函数择优沉淀成轻量记忆。
-        """
-        if not self.feature_enabled("memory"):
-            return
-        path = args.get("path")
-        if not path:
-            return
-
-        canonical_path = self.memory.canonical_path(path)
-        # 不是所有工具结果都进入工作记忆。
-        # 读文件会生成摘要；写文件/patch 会让旧摘要失效，因为它们可能过期了。
-        if name in {"read_file", "write_file", "patch_file"}:
-            self.memory.remember_file(canonical_path)
-        if name == "read_file":
-            summary = memorylib.summarize_read_result(result)
-            self.memory.set_file_summary(canonical_path, summary)
-        elif name in {"write_file", "patch_file"}:
-            self.memory.invalidate_file_summary(canonical_path)
-
-    def note_tool(self, name, args, result):
-        self.update_memory_after_tool(name, args, result)
-
-    def reject_durable_reason(self, note_text):
-        text = str(note_text or "").strip()
-        lowered = text.lower()
-        if not text:
-            return "empty"
-        if REDACTED_VALUE in text or SECRET_SHAPED_TEXT_PATTERN.search(text):
-            return "secret_shaped"
-        checkpoint_like_prefixes = (
-            "current goal",
-            "current blocker",
-            "next step",
-            "current phase",
-            "key files",
-            "freshness",
-            "当前目标",
-            "当前卡点",
-            "下一步",
-            "当前阶段",
-            "关键文件",
-            "已完成",
-            "已排除",
-        )
-        if any(lowered.startswith(prefix) for prefix in checkpoint_like_prefixes):
-            return "transient_task_state"
-        if re.search(r"(?i)\b(stdout|stderr|traceback|exit_code)\b", text) or len(text) > 220:
-            return "noisy_output"
-        return ""
-
-    def extract_durable_promotions(self, user_message, final_answer):
-        user_text = str(user_message or "")
-        if not (DURABLE_MEMORY_INTENT_PATTERN.search(user_text) or DURABLE_MEMORY_INTENT_ZH_PATTERN.search(user_text)):
-            return [], []
-        promotions = []
-        rejections = []
-        for line in str(final_answer or "").splitlines():
-            text = line.strip()
-            if not text or REDACTED_VALUE in text:
-                continue
-            for topic, pattern in DURABLE_MEMORY_LINE_PATTERNS:
-                match = pattern.match(text)
-                if not match:
-                    continue
-                note_text = match.group(1).strip()
-                if note_text:
-                    reason = self.reject_durable_reason(note_text)
-                    if reason:
-                        rejections.append(f"{topic}:{reason}")
-                        break
-                    promotions.append((topic, note_text))
-                break
-        return promotions, rejections
-
-    def promote_durable_memory(self, user_message, final_answer):
-        promotions, rejections = self.extract_durable_promotions(user_message, final_answer)
-        promoted, superseded = self.memory.promote_durable(promotions)
-        self.session["memory"] = self.memory.to_dict()
-        self.last_durable_promotions = promoted
-        self.last_durable_rejections = rejections
-        self.last_durable_superseded = superseded
-        return promoted, rejections, superseded
+    def memory_result_text(self, user_message, final_candidate, review):
+        """用户明确保存时以落盘结果为准，移除主模型未经证实的保存声明。"""
+        if not has_memory_intent(user_message):
+            return final_candidate
+        cleaned = re.sub(
+            r"(?i)[，,]?\s*(?:我)?(?:已经|已)(?:记住|保存|更新记忆)(?:了|成功)?[。.!！]?|"
+            r"(?i:i (?:have )?(?:saved|remembered)(?: it)?)",
+            "",
+            final_candidate,
+        ).strip()
+        if not is_explicit_request(user_message):
+            if review.get("status") == "failed":
+                return (cleaned + "\n\n记忆未保存：记忆审查或写入失败。").strip()
+            return cleaned
+        changes = review.get("changes", [])
+        if changes:
+            statuses = []
+            for change in changes:
+                if change["action"] == "forgotten":
+                    statuses.append(f"已忘记：{change['key']}（{change['scope']}）。")
+                elif change["action"] == "updated":
+                    statuses.append(f"原有记忆已更新为：{change['current_value']}（{change['scope']}）。")
+                else:
+                    statuses.append(f"已记住：{change['current_value']}（{change['scope']}）。")
+            status_text = "\n".join(statuses)
+        elif review.get("status") == "needs_clarification":
+            status_text = "未保存：需要澄清要记住的具体内容或是否替换现有记忆。"
+        elif review.get("status") == "failed":
+            status_text = "未保存：记忆审查或写入失败；本次任务回答不受影响。"
+        else:
+            status_text = "记忆未变更：已有相同内容，或本轮没有新的长期记忆。"
+        return (cleaned + "\n\n" + status_text).strip()
 
     def _recovery_trace_identity(self):
         checkpoint = self.recovery_checkpoint or {}
@@ -1001,8 +1020,9 @@ class CAgent:
         这里就是最关键的入口。
         """
         run_started_at = time.monotonic()
-        self.memory.set_task_summary(user_message)
-        self.record({"role": "user", "content": user_message, "created_at": now()})
+        user_turn = {"role": "user", "content": user_message, "created_at": now()}
+        self.record(user_turn)
+        self.last_memory_review = {"status": "not_run", "changes": [], "failure_reason": ""}
 
         task_state = TaskState.create(run_id=self.new_run_id(), task_id=self.new_task_id(), user_request=user_message)
         self.recovery_state = self.evaluate_recovery_state()
@@ -1040,7 +1060,7 @@ class CAgent:
         # 1. 感知：重新组 prompt，把当前状态整理给模型看
         # 2. 决策：让模型返回一个工具调用，或一个最终答案
         # 3. 行动：如果是工具调用，就执行工具
-        # 4. 记录：把结果写回 history / task_state / trace / memory
+        # 4. 记录：把结果写回 history / task_state / trace
         # 然后进入下一轮，直到停机条件满足
         def common_prefix_split(a: str, b: str):
             i = 0
@@ -1055,7 +1075,6 @@ class CAgent:
 
             return common, a_suffix, b_suffix
 
-        pre_prompt = None
         while tool_steps < self.max_steps and attempts < max_attempts:
             attempts += 1
             task_state.record_attempt()
@@ -1162,9 +1181,16 @@ class CAgent:
                 continue
 
             final = (payload or raw).strip()
-            self.record({"role": "assistant", "content": final, "created_at": now()})
+            assistant_turn_id = "turn_" + uuid.uuid4().hex[:12]
+            review = self.review_memory_after_turn(user_turn, final)
+            self.emit_trace(task_state, "memory_review", {
+                "status": review["status"], "change_ids": [change["id"] for change in review["changes"]],
+                "failure_reason": review["failure_reason"], "duration_ms": review["duration_ms"],
+                "completion": review["completion"],
+            })
+            final = self.memory_result_text(user_message, final, review)
+            self.record({"role": "assistant", "turn_id": assistant_turn_id, "content": final, "created_at": now()})
             task_state.finish_success(final)
-            self.promote_durable_memory(user_message, final)
             self.run_store.write_task_state(task_state)
             self.emit_trace(
                 task_state,
@@ -1185,16 +1211,7 @@ class CAgent:
         else:
             final = "Stopped after reaching the step limit without a final answer."
             task_state.stop_step_limit(final)
-        """
-        模型认为任务完成。做四件事：
-        把最终答案写入 history
-        把 task_state 标为 completed
-        尝试把模型回答中的 Project convention: / Decision: 等行提升为持久记忆
-        写 report 并返回
-        build_report() 汇总了 prompt_metadata、durable_promotions、redacted_env 等所有关键信息，redact_artifact() 做一遍 secret 替换后落盘。
-        """
         self.record({"role": "assistant", "content": final, "created_at": now()})
-        self.promote_durable_memory(user_message, final)
         self.run_store.write_task_state(task_state)
         self.emit_trace(
             task_state,
@@ -1226,11 +1243,11 @@ class CAgent:
         它位于 `ask()` 的“模型决定要调用工具”之后，是控制循环里真正把模型
         意图落到外部世界的一步。因此这里串起了几乎所有安全与可控设计：
         工具是否存在、参数是否合法、是否重复、是否需要审批、执行结果是否裁剪、
-        是否需要回写记忆。
+        以及结果如何进入 history 和 trace。
         """
         # 工具执行不是“直接调函数”，而是一条带护栏的流水线：
         # 工具是否存在 -> 参数是否合法 -> 是否重复调用 -> 是否通过审批
-        # -> 真正执行 -> 更新记忆。
+        # -> 真正执行 -> 记录结果。
         """
         工具名校验 
         """
@@ -1353,7 +1370,6 @@ class CAgent:
                 elif exit_code != 0:
                     tool_status = "error"
                     tool_error_code = "tool_failed"
-            self.update_memory_after_tool(name, args, result)
             self._last_tool_result_metadata = {
                 "tool_status": tool_status,
                 "tool_error_code": tool_error_code,
@@ -1415,9 +1431,15 @@ class CAgent:
             "recovery": dict(self._run_recovery_summary),
             "task_state": task_state.to_dict(),
             "prompt_metadata": self.last_prompt_metadata,
-            "durable_promotions": list(self.last_durable_promotions),
-            "durable_rejections": list(self.last_durable_rejections),
-            "durable_superseded": list(self.last_durable_superseded),
+            "memory_review_status": self.last_memory_review.get("status", "not_run"),
+            "memory_changes": list(self.last_memory_review.get("changes", [])),
+            "memory_review_failure_reason": self.last_memory_review.get("failure_reason", ""),
+            "memory_review_duration_ms": self.last_memory_review.get("duration_ms", 0),
+            "memory_review_completion": dict(self.last_memory_review.get("completion", {})),
+            "memory_review_input_tokens": self.last_memory_review.get("completion", {}).get("input_tokens"),
+            "memory_review_output_tokens": self.last_memory_review.get("completion", {}).get("output_tokens"),
+            "selected_card_ids": list(self.last_prompt_metadata.get("selected_card_ids", [])),
+            "legacy_memory_present": self.legacy_memory_present,
             "redacted_env": self.detected_secret_env_summary(),
         }
 
@@ -1624,9 +1646,6 @@ class CAgent:
 
     def reset(self):
         self.session["history"] = []
-        self.session["memory"].clear()
-        self.session["memory"].update(memorylib.default_memory_state())
-        self.memory = memorylib.LayeredMemory(self.session["memory"], workspace_root=self.root)
         self.session_store.save(self.session)
 
     def path(self, raw_path):

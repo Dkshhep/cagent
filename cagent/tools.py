@@ -294,8 +294,7 @@ def tool_delegate(agent, args):
     )
     # 委派的目标是“调查”，不是“放权执行”。
     # 子 agent 以只读方式运行、步数更少，最后只把结论文本返回给父 agent。
-    child.session["memory"]["task"] = task
-    child.session["memory"]["notes"] = [clip(agent.history_text(), 300)]
+    child.record({"role": "assistant", "content": "Parent context: " + clip(agent.history_text(), 300)})
     return "delegate_result:\n" + child.ask(task)
 
 

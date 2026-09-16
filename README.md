@@ -2,14 +2,14 @@
 
 CAgent 是一个面向本地代码仓库的轻量级 Coding Agent Harness。它运行在终端中，能够读取当前工作区、调用受约束的本地工具、维护会话状态，并用最小 recovery checkpoint 保护未确认的副作用操作。
 
-这个项目的重点不是做一个聊天窗口，而是实现一个完整的本地代码 agent runtime：统一模型接入、上下文管理、工具执行、审批控制、短期/长期记忆、副作用恢复和运行工件管理。
+这个项目的重点不是做一个聊天窗口，而是实现一个完整的本地代码 agent runtime：统一模型接入、上下文管理、工具执行、审批控制、用户授权的长期记忆、副作用恢复和运行工件管理。
 
 ## 项目亮点
 
 - **Agent Harness Runtime**：串联用户请求、prompt 组装、模型调用、工具执行、history 持久化和 report 落盘的完整控制循环。
 - **多模型后端接入**：支持 Ollama、OpenAI-compatible Responses API、Anthropic-compatible Messages API，以及 DeepSeek 的 Anthropic-compatible endpoint。
 - **受约束工具系统**：内置 7 类工具能力，包括 `list_files`、`read_file`、`search`、`run_shell`、`write_file`、`patch_file` 和只读 `delegate`。
-- **上下文与记忆管理**：在 token 预算内组合 workspace prefix、历史对话、工作记忆、相关记忆、临时 recovery notice 和当前请求；压缩历史以自包含的 `distilled-history` marker 留在 history 中。
+- **上下文与记忆管理**：在 token 预算内组合 workspace prefix、历史对话、当前有效的用户偏好卡片、临时 recovery notice 和当前请求；压缩历史以自包含的 `distilled-history` marker 留在 history 中。
 - **Recovery Checkpoint**：仅在 `write_file`、`patch_file` 或 `run_shell` 已进入执行但结果尚未可靠写入 history 时存在；恢复后强制先做只读调查，禁止盲目重放副作用。
 - **可复盘运行工件**：每次运行都会在 `.cagent/runs/` 下写出 `task_state.json`、`trace.jsonl` 和 `report.json`。
 - **MCP 扩展能力**：支持从 `.mcp.json` 加载外部 MCP server，并把 MCP 工具暴露给顶层 agent。
@@ -18,12 +18,12 @@ CAgent 是一个面向本地代码仓库的轻量级 Coding Agent Harness。它�
 
 CAgent 的核心模块如下：
 
-- `cagent.runtime.CAgent`：主控制循环，负责组装 prompt、解析模型输出、校验并执行工具、记录 history、更新 memory、管理 recovery guard、写入 trace/report。
+- `cagent.runtime.CAgent`：主控制循环，负责组装 prompt、解析模型输出、校验并执行工具、记录 history、审查记忆变更、管理 recovery guard、写入 trace/report。
 - `cagent.recovery.RecoveryCheckpointStore`：管理 session 级 active recovery checkpoint，并比较文件工具执行前后的目标状态。
 - `cagent.storage.write_json_atomic`：为 session、recovery、task state 和 report 提供 fsync + replace 的原子 JSON 写入。
 - `cagent.models`：模型适配层，OpenAI-compatible、Anthropic-compatible 和 DeepSeek-compatible 后端。
 - `cagent.context_manager.ContextManager`：上下文组装与预算控制，负责按 section 渲染 prompt 并在超预算时压缩低优先级内容。
-- `cagent.memory.LayeredMemory`：工作记忆层，维护任务摘要、最近文件、文件摘要、临时笔记和 durable memory topics。
+- `cagent.memory_cards` / `memory_store` / `memory_decider`：分别负责记忆卡片校验、原子持久化与独立 LLM 提案。仅保存用户长期偏好或明确要求记住的内容。
 - `cagent.tools`：本地工具注册、参数校验和执行逻辑。
 - `cagent.run_store.RunStore`：按 run 写入 `task_state.json`、`trace.jsonl` 和 `report.json`。
 - `cagent.mcp.McpManager`：启动并注册 `.mcp.json` 中配置的 MCP 工具。
@@ -39,8 +39,9 @@ CAgent 的核心模块如下：
   -> 校验工具参数与审批策略
   -> 副作用工具执行前原子写 recovery checkpoint
   -> 执行工具并将结果原子写入 session/history
-  -> 清理 recovery checkpoint，更新 memory / task state / trace
+  -> 清理 recovery checkpoint，更新 task state / trace
   -> 循环直到 final answer 或命中停止条件
+  -> 在 final 写入 history 前独立审查并提交用户授权的记忆变更
 ```
 
 ## 安装
@@ -160,9 +161,12 @@ python -m cagent [prompt] \
 交互模式内置命令：
 
 - `/help`：查看帮助。
-- `/memory`：查看当前工作记忆。
+- `/memory` 或 `/memory list`：列出当前有效的记忆卡片。
+- `/memory show <id>`：查看卡片来源与修订历史。
+- `/memory forget <id>`：停止使用卡片；`/memory delete <id>`：彻底删除。
+- `/memory migrate preview`：预览旧 topic 候选；`/memory migrate import <candidate-id>...`：显式选择导入。
 - `/session`：查看当前 session 文件路径。
-- `/reset`：清空当前 session 的历史和记忆。
+- `/reset`：只清空当前 session 历史，不删除长期记忆卡片。
 - `/exit` 或 `/quit`：退出 REPL。
 
 ## 工具系统
@@ -196,13 +200,13 @@ CAgent 的本地状态默认写在仓库下的 `.cagent/`：
       trace.jsonl
       report.json
   memory/
-    MEMORY.md
-    topics/
+    cards.json                  # 当前项目的记忆卡片
+    MEMORY.md, topics/          # 旧记忆只读保留，不自动导入
 ```
 
-- `<session_id>.json`：保存正常 resume 的事实源，包括完整会话 history 和工作记忆。
+- `<session_id>.json`：保存正常 resume 的事实源，包括会话 history；旧 session memory 字段只作兼容备份。
 - `<session_id>.recovery.json`：只标记一个结果尚未确认的副作用工具；正常完成时不存在。
 - `task_state.json`：保存当前任务的生命周期状态。
 - `trace.jsonl`：逐条记录运行过程事件，适合排查 agent 为什么做了某个动作。
 - `report.json`：保存最终运行摘要、当次 recovery 摘要、prompt metadata、工具统计和敏感信息脱敏结果。
-- `memory/`：保存由模型显式沉淀的长期记忆主题。
+- `memory/cards.json`：保存当前项目的用户授权卡片。全局卡片另存于用户主目录的 `.cagent/memory/cards.json`；项目级同 key 卡片在当前项目覆盖全局卡片。

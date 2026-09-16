@@ -134,8 +134,7 @@ def test_prompt_cache_layout_scenarios_keep_current_request_and_expected_order(t
     assert artifact["variants"]["current"]["section_order"] == [
         "prefix",
         "history",
-        "memory",
-        "relevant_memory",
+        "saved_memory",
         "current_request",
     ]
     for scenario in artifact["scenarios"]:
@@ -148,8 +147,7 @@ def test_prompt_cache_layout_scenarios_keep_current_request_and_expected_order(t
         for section, count in scenario["variants"]["current"]["changed_section_counts"].items():
             changed_sections[section] = changed_sections.get(section, 0) + count
     assert changed_sections["history"] > 0
-    assert changed_sections["memory"] > 0
-    assert changed_sections["relevant_memory"] > 0
+    assert changed_sections["saved_memory"] > 0
 
 
 def test_provider_profile_loads_project_env_before_reading_deepseek_config(tmp_path, monkeypatch):
@@ -192,10 +190,13 @@ def test_run_memory_ablation_v2_writes_expected_artifact(tmp_path):
     )
 
     assert artifact_path.exists()
-    assert artifact["artifact_type"] == "memory-ablation-v2"
-    assert artifact["task_count"] == 12
-    assert set(artifact["variants"]) == {"memory_on", "memory_off", "memory_irrelevant"}
-    assert "memory_hit_rate" in artifact["variants"]["memory_on"]
+    assert artifact["artifact_type"] == "memory-card-ablation-v1"
+    assert artifact["scenario_count"] == 1
+    assert artifact["real_model_calls"] is False
+    assert artifact["summary"]["duplicate_card_rate"] == 0.0
+    assert artifact["summary"]["old_value_leak_rate"] == 0.0
+    assert artifact["summary"]["temporary_save_rate"] == 0.0
+    assert artifact["summary"]["secret_rejection_rate"] == 1.0
 
 
 def test_run_recovery_ablation_v2_writes_expected_artifact(tmp_path):
@@ -246,4 +247,4 @@ def test_write_benchmark_core_report_marks_resume_safe_metrics(tmp_path):
     assert "只适合放文档/面试展开的指标" in report_text
     assert "recovery_detection_rate" in report_text
     assert "duplicate_mutation_rate" in report_text
-    assert "memory_hit_rate" in report_text
+    assert "memory_on_selection_rate" in report_text

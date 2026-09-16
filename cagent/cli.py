@@ -6,6 +6,7 @@
 """
 
 import argparse
+import json
 import os
 import shutil
 import sys
@@ -14,6 +15,8 @@ import textwrap
 from .config import load_project_env, provider_env
 from .context_manager import DEFAULT_OUTPUT_RESERVE_TOKENS
 from .mcp import McpManager
+from .memory_decider import MemoryDecider
+from .memory_cards import MemoryValidationError
 from .models import AnthropicCompatibleModelClient, DeepSeekCompatibleModelClient, OllamaModelClient, OpenAICompatibleModelClient
 from .runtime import CAgent, SessionStore
 from .workspace import WorkspaceContext, middle
@@ -46,9 +49,14 @@ HELP_DETAILS = textwrap.dedent(
     """\
     Commands:
     /help    Show this help message.
-    /memory  Show the agent's distilled working memory.
+    /memory [list]           List active saved memory cards.
+    /memory show <id>        Show a card with source and revisions.
+    /memory forget <id>      Stop using a card.
+    /memory delete <id>      Permanently delete a card.
+    /memory migrate preview Show legacy topic import candidates.
+    /memory migrate import <candidate-id>...  Import selected legacy candidates.
     /session Show the path to the saved session file.
-    /reset   Clear the current session history and memory.
+    /reset   Clear this session's history; saved cards remain.
     /exit    Exit the agent.
     """
 ).strip()
@@ -227,6 +235,7 @@ def build_agent(args):
     configured_secret_names = _configured_secret_names(args)
     store = SessionStore(workspace.repo_root + "/.cagent/sessions")
     model = _build_model_client(args)
+    memory_decider = MemoryDecider(model)
     # 启动时按 .mcp.json 连接外部 MCP server;失败的 server 在 manager 内部降级跳过。
     mcp_manager = McpManager.from_path(workspace.repo_root + "/.mcp.json")
     mcp_manager.start_all()
@@ -245,6 +254,7 @@ def build_agent(args):
                 max_new_tokens=args.max_new_tokens,
                 secret_env_names=configured_secret_names,
                 mcp_manager=mcp_manager,
+                memory_decider=memory_decider,
             )
         return CAgent(
             model_client=model,
@@ -255,6 +265,7 @@ def build_agent(args):
             max_new_tokens=args.max_new_tokens,
             secret_env_names=configured_secret_names,
             mcp_manager=mcp_manager,
+            memory_decider=memory_decider,
         )
     except BaseException:
         # 构造 CAgent 失败时,别把已经启动的 MCP 子进程泄漏掉。
@@ -300,6 +311,43 @@ def build_arg_parser():
     return parser
 
 
+def handle_memory_command(agent, command):
+    """CLI 的显式管理入口；普通 Agent 回答不能绕过它直接迁移旧数据。"""
+    parts = command.split()
+    action = parts[1:] if len(parts) > 1 else ["list"]
+    try:
+        if action == ["list"]:
+            cards = [*agent.memory_store.active("project"), *agent.memory_store.active("global")]
+            if not cards:
+                return "No active saved memory cards."
+            return "\n".join(
+                f"{card['id']}  {card['scope']}  {card['key']}  {card['current_value']}"
+                for card in cards
+            )
+        if len(action) == 2 and action[0] == "show":
+            card = agent.memory_store.get(action[1])
+            return json.dumps(card, ensure_ascii=False, indent=2) if card else "Memory card not found."
+        if len(action) == 2 and action[0] in {"forget", "delete"}:
+            card = agent.memory_store.forget(action[1], hard=action[0] == "delete")
+            return ("Deleted" if action[0] == "delete" else "Forgot") + f" {card['id']}."
+        if action == ["migrate", "preview"]:
+            candidates = agent.memory_store.migration_preview()
+            if not candidates:
+                return "No legacy topic candidates."
+            return "\n".join(
+                f"{item['id']}  {item['suggested_scope']}  {item['suggested_key']}  "
+                f"{item['text']}  conflict={item['conflict'] or 'none'}"
+                for item in candidates
+            )
+        if len(action) >= 3 and action[:2] == ["migrate", "import"]:
+            imported = agent.memory_store.import_legacy(action[2:])
+            return "Imported: " + ", ".join(item["id"] for item in imported)
+    except (OSError, ValueError, TimeoutError, KeyError, TypeError) as exc:
+        detail = str(exc) if isinstance(exc, MemoryValidationError) else exc.__class__.__name__
+        return f"Memory command failed: {detail}"
+    return "Usage: /memory [list|show <id>|forget <id>|delete <id>|migrate preview|migrate import <candidate-id>...]"
+
+
 def main(argv=None):
     args = build_arg_parser().parse_args(argv)
     agent = build_agent(args)
@@ -322,7 +370,7 @@ def main(argv=None):
 
         while True:
             # 交互模式：每次读取一条用户输入，交给同一个 agent，
-            # 因此 session history 和 working memory 会跨轮延续。
+            # 因此 session history 会跨轮延续；长期卡片单独落盘。
             try:
                 user_input = input("\ncagent> ").strip()
             except (EOFError, KeyboardInterrupt):
@@ -336,15 +384,15 @@ def main(argv=None):
             if user_input == "/help":
                 print(HELP_DETAILS)
                 continue
-            if user_input == "/memory":
-                print(agent.memory_text())
+            if user_input == "/memory" or user_input.startswith("/memory "):
+                print(handle_memory_command(agent, user_input))
                 continue
             if user_input == "/session":
                 print(agent.session_path)
                 continue
             if user_input == "/reset":
                 agent.reset()
-                print("session reset")
+                print("session reset; saved memory cards unchanged")
                 continue
 
             print()
